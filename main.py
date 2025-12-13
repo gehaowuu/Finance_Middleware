@@ -2,6 +2,7 @@ import os
 import logging
 import time
 import json
+import re
 import datetime as dt
 from datetime import datetime, timedelta, date
 from io import StringIO
@@ -258,47 +259,81 @@ EVENT_RELEASES = [
 ]
 
 
-def fred_last_release_date(release_id: int, timeout: int = 15) -> Optional[str]:
+def fred_release_last_next(release_id: int, timeout: int = 15) -> Tuple[Optional[str], Optional[str]]:
+    """返回 (last_release_date, next_scheduled_release_date)（按日历日期）。
+
+    说明：FRED 的 /fred/release/dates 支持 include_release_dates_with_no_data=true，可返回未来排期。
+    为避免一次性拉全量历史，这里取最近 N 条（desc），再从中计算 last/next。
+    """
     if not FRED_API_KEY:
-        return None
+        return None, None
     url = "https://api.stlouisfed.org/fred/release/dates"
     params = {
         "api_key": FRED_API_KEY,
         "file_type": "json",
         "release_id": release_id,
         "sort_order": "desc",
-        "limit": 1,
+        "limit": 200,
+        "include_release_dates_with_no_data": "true",
     }
     try:
-        r = requests.get(url, params=params, timeout=timeout)
+        r = requests.get(url, params=params, timeout=timeout, headers=DEFAULT_HEADERS)
         r.raise_for_status()
         data = r.json() or {}
         dates = data.get("release_dates", []) or []
-        if dates:
-            return dates[0].get("date")
+        if not dates:
+            return None, None
+
+        today = dt.date.today()
+        parsed: List[dt.date] = []
+        for row in dates:
+            ds = row.get("date")
+            if not ds:
+                continue
+            try:
+                parsed.append(dt.datetime.strptime(ds, "%Y-%m-%d").date())
+            except Exception:
+                continue
+
+        if not parsed:
+            return None, None
+
+        last_past = max((d for d in parsed if d <= today), default=None)
+        next_future = min((d for d in parsed if d >= today), default=None)
+        return (
+            last_past.isoformat() if last_past else None,
+            next_future.isoformat() if next_future else None,
+        )
     except Exception:
-        return None
-    return None
+        return None, None
 
 
 def build_events_fred(timeout: int = 15) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     for item in EVENT_RELEASES:
-        d = fred_last_release_date(item["release_id"], timeout=timeout)
-        if d:
-            events.append({"event": item["name"], "last_release_date": d, "source": "FRED"})
+        last_d, next_d = fred_release_last_next(item["release_id"], timeout=timeout)
+        if last_d or next_d:
+            events.append(
+                {
+                    "event": item["name"],
+                    "last_release_date": last_d,
+                    "next_release_date": next_d,
+                    "source": "FRED",
+                }
+            )
     return events
 
 
 # -------- CBOE PCR helpers --------
 def _read_csv_url(url: str, timeout: int = 15) -> pd.DataFrame:
-    headers = {"User-Agent": "finance-middleware/1.0", "Accept": "text/csv,*/*"}
+    # 部分 CDN/站点会对“非浏览器 UA”返回 403/400，因此统一使用浏览器风格 headers。
+    headers = {**DEFAULT_HEADERS, "Accept": "text/csv,*/*;q=0.9"}
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return pd.read_csv(StringIO(r.text))
 
 def _download_text(url: str, timeout: int = 15) -> str:
-    headers = {"User-Agent": "finance-middleware/1.0", "Accept": "text/csv,*/*"}
+    headers = {**DEFAULT_HEADERS, "Accept": "text/csv,*/*;q=0.9"}
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.text
@@ -312,7 +347,12 @@ def _find_header_line_index(lines: List[str], header_token: str) -> Optional[int
 
 
 def _parse_pc_csv(text: str) -> Tuple[float, str]:
-    lines = text.splitlines()
+    # CBOE 的 CSV 在不同时期/不同文件上可能存在：
+    # - 顶部说明行（非 CSV header）
+    # - 无 header，直接从数据行开始（例如含 "TOTAL,P/C Ratio 11/1/2006,..."）
+    # - 不同日期列名（Date / Trade_date）
+    # 因此解析逻辑需尽量宽容。
+    lines = [ln.strip("\ufeff") for ln in text.splitlines()]
     # 1) Date-based tables (totalpc/equitypc)
     idx = _find_header_line_index(lines, "Date,")
     if idx is not None:
@@ -365,7 +405,54 @@ def _parse_pc_csv(text: str) -> Tuple[float, str]:
         last = df.iloc[-1]
         return float(last[ratio_col]), last[date_col].date().isoformat()
 
-    raise ValueError("Unknown CBOE CSV format (no Date,/Trade_date header found).")
+    # 3) 无显式表头：逐行提取日期与最后一列（通常为 ratio）
+    date_mdY = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b")
+    date_Ymd = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+    candidates: List[Tuple[dt.date, float]] = []
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(",") if p.strip()]
+        if len(parts) < 2:
+            continue
+
+        # 在前两列中找日期（以及可能夹在字符串中的日期）
+        date_token: Optional[str] = None
+        for token in parts[:2]:
+            m = date_Ymd.search(token)
+            if m:
+                date_token = m.group(1)
+                break
+            m = date_mdY.search(token)
+            if m:
+                date_token = m.group(1)
+                break
+        if not date_token:
+            continue
+
+        # 解析日期
+        try:
+            if "-" in date_token:
+                d = dt.datetime.strptime(date_token, "%Y-%m-%d").date()
+            else:
+                d = dt.datetime.strptime(date_token, "%m/%d/%Y").date()
+        except Exception:
+            continue
+
+        # 默认取最后一列为 ratio（可能含空格/符号）
+        raw_ratio = parts[-1]
+        raw_ratio = re.sub(r"[^0-9eE\-\.]+", "", raw_ratio)
+        try:
+            ratio = float(raw_ratio)
+        except Exception:
+            continue
+        candidates.append((d, ratio))
+
+    if candidates:
+        d, ratio = max(candidates, key=lambda x: x[0])
+        return float(ratio), d.isoformat()
+
+    raise ValueError("Unknown CBOE CSV format (no Date,/Trade_date header found and no date rows parsed).")
 
 
 def get_cboe_put_call_ratio(timeout: int = 15) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -528,10 +615,20 @@ def fetch_fundamentals(date_str: str) -> Dict[str, Any]:
         "dgs2": None,
         "dgs10": None,
         "fedfunds": None,
+        "effr": None,
+        "effr_date": None,
         "term_spread": None,
         "ffr_minus_2y": None,
         "fedfunds_date": None,
         "ffr_minus_2y_note": None,
+        "real10y": None,
+        "real10y_date": None,
+        "breakeven10y": None,
+        "breakeven10y_date": None,
+        "ig_oas": None,
+        "ig_oas_date": None,
+        "hy_oas": None,
+        "hy_oas_date": None,
     }
     if fred_client:
         try:
@@ -544,12 +641,18 @@ def fetch_fundamentals(date_str: str) -> Dict[str, Any]:
         except Exception as exc:
             logging.warning("Failed to fetch FRED rates: %s", exc)
 
-    # Fed Funds：优先 EFFR，再退 FEDFUNDS，取最近一次有效值
-    effr, _ = fred_latest_observation("EFFR")
-    ff_obs, ff_note = (effr, None) if effr else fred_latest_observation("FEDFUNDS")
+    # Policy rate：分别返回 EFFR 与 FEDFUNDS（同时以 EFFR 优先作为 fedfunds 字段）
+    effr_obs, _ = fred_latest_observation("EFFR")
+    if effr_obs:
+        rates["effr"] = effr_obs.get("value")
+        rates["effr_date"] = effr_obs.get("date")
+
+    ff_obs = effr_obs
+    if not ff_obs:
+        ff_obs, _ = fred_latest_observation("FEDFUNDS")
     if ff_obs:
-        rates["fedfunds"] = ff_obs["value"]
-        rates["fedfunds_date"] = ff_obs["date"]
+        rates["fedfunds"] = ff_obs.get("value")
+        rates["fedfunds_date"] = ff_obs.get("date")
     else:
         rates["fedfunds"] = None
         rates["fedfunds_date"] = None
@@ -563,6 +666,24 @@ def fetch_fundamentals(date_str: str) -> Dict[str, Any]:
     dgs10_obs, _ = fred_latest_observation("DGS10")
     rates["dgs2_date"] = dgs2_obs["date"] if dgs2_obs else None
     rates["dgs10_date"] = dgs10_obs["date"] if dgs10_obs else None
+
+    # 额外 FRED 指标：实值利率 / 通胀预期 / 信用利差（用于更稳定的宏观与风险判断）
+    real10y_obs, _ = fred_latest_observation("DFII10")  # 10Y TIPS real yield
+    if real10y_obs:
+        rates["real10y"] = real10y_obs.get("value")
+        rates["real10y_date"] = real10y_obs.get("date")
+    breakeven10y_obs, _ = fred_latest_observation("T10YIE")  # 10Y breakeven inflation
+    if breakeven10y_obs:
+        rates["breakeven10y"] = breakeven10y_obs.get("value")
+        rates["breakeven10y_date"] = breakeven10y_obs.get("date")
+    ig_oas_obs, _ = fred_latest_observation("BAMLC0A0CM")
+    if ig_oas_obs:
+        rates["ig_oas"] = ig_oas_obs.get("value")
+        rates["ig_oas_date"] = ig_oas_obs.get("date")
+    hy_oas_obs, _ = fred_latest_observation("BAMLH0A0HYM2")
+    if hy_oas_obs:
+        rates["hy_oas"] = hy_oas_obs.get("value")
+        rates["hy_oas_date"] = hy_oas_obs.get("date")
 
     dxy_value, dxy_ticker = _first_available_price(
         ["DX-Y.NYB", "DXY", "USDOLLAR"], target, start, target + timedelta(days=1)
@@ -841,10 +962,32 @@ def build_prompt_context(modules: Dict[str, Any], labels: Dict[str, str]) -> str
     technicals = modules["technicals"]
 
     news_lines = [f"- {n['title']} (source: {n.get('source')})" for n in fundamentals.get("news", [])]
-    event_lines = [
-        f"- {e.get('category')}: {e.get('actual')} (fcst {e.get('forecast')}, prev {e.get('previous')})"
-        for e in fundamentals.get("events", [])
-    ]
+
+    # TE snapshot 与 FRED fallback 的字段不同：
+    # - TE: {country, date, category, event, actual, previous, forecast, importance}
+    # - FRED: {event, last_release_date, next_release_date}
+    event_lines: List[str] = []
+    for e in fundamentals.get("events", []) or []:
+        if e.get("event") and (e.get("last_release_date") or e.get("next_release_date")):
+            parts = []
+            if e.get("last_release_date"):
+                parts.append(f"last {e.get('last_release_date')}")
+            if e.get("next_release_date"):
+                parts.append(f"next {e.get('next_release_date')}")
+            event_lines.append(f"- {e.get('event')}: {', '.join(parts)} (source {e.get('source')})")
+            continue
+
+        # TE snapshot (或其它 calendar 数据)
+        when = (e.get("date") or "").strip()
+        where = (e.get("country") or "").strip()
+        cat = (e.get("category") or "").strip()
+        name = (e.get("event") or "").strip()
+        label = " - ".join([x for x in [cat, name] if x]) or "(unknown event)"
+        header = " ".join([x for x in [when, where, label] if x]).strip()
+        actual = e.get("actual")
+        forecast = e.get("forecast")
+        previous = e.get("previous")
+        event_lines.append(f"- {header}: act {actual} / fcst {forecast} / prev {previous}")
     assets = technicals.get("assets", {})
     asset_lines = []
     for name, data in assets.items():
@@ -866,6 +1009,9 @@ def build_prompt_context(modules: Dict[str, Any], labels: Dict[str, str]) -> str
         f"- 2Y: {_fmt_num(fundamentals.get('dgs2'), 2, '%')} | 10Y: {_fmt_num(fundamentals.get('dgs10'), 2, '%')} "
         f"| Term spread: {_fmt_num(fundamentals.get('term_spread'), 2, '%')}",
         f"- Fed Funds: {_fmt_num(fundamentals.get('fedfunds'), 2, '%')} | FFR-2Y: {_fmt_num(fundamentals.get('ffr_minus_2y'), 2, '%')}",
+        f"- EFFR: {_fmt_num(fundamentals.get('effr'), 2, '%')} | Real10Y: {_fmt_num(fundamentals.get('real10y'), 2, '%')} "
+        f"| 10Y BE: {_fmt_num(fundamentals.get('breakeven10y'), 2, '%')} | IG OAS: {_fmt_num(fundamentals.get('ig_oas'), 2)} "
+        f"| HY OAS: {_fmt_num(fundamentals.get('hy_oas'), 2)}",
         f"- DXY: {_fmt_num(fundamentals.get('dxy'))} (ticker {fundamentals.get('dxy_ticker') or 'DX-Y.NYB/DXY'})",
         f"- Key events:\n{chr(10).join(event_lines) if event_lines else '  (none, maybe credentials missing)'}",
         f"- Top news:\n{chr(10).join(news_lines) if news_lines else '  (none)'}",
@@ -894,6 +1040,81 @@ def build_prompt_context(modules: Dict[str, Any], labels: Dict[str, str]) -> str
         f"Sentiment: {labels.get('sentiment_regime')} | Technical: {labels.get('technical_regime')}",
     ]
     return "\n".join(prompt)
+
+
+def build_llm_prompts(date_str: str, modules: Dict[str, Any], labels: Dict[str, str]) -> Dict[str, str]:
+    """基于 v1/context 的模块数据，生成可直接喂给 LLM 的 system/user 提示词。
+
+    目标：
+    1) 模块内关联 + regime（fundamentals/liquidity/sentiment/technicals）
+    2) 跨模块综合（相关性/驱动/一致性）
+    3) 按固定框架输出整体趋势与风险场景
+    """
+    prompt_context = build_prompt_context(modules, labels)
+
+    system_prompt = (
+        "你是一名买方宏观与跨资产策略分析师。你必须严格基于输入数据推断，"
+        "不得臆造未提供的事实/数值；若数据缺失需明确标注。"
+        "输出需专业、结构化、可执行。"
+    )
+
+    # 固定框架（面向 Dify/LLM）：先模块内，再跨模块，最后给出趋势与情景。
+    user_prompt = f"""
+你将获得一份市场快照（时间标签：{date_str}）。请仅基于该快照完成分析。
+
+快照数据（已做必要的数值汇总）：
+{prompt_context}
+
+已给出的 regime 标签：
+- Macro: {labels.get('macro_regime')}
+- Liquidity: {labels.get('liquidity_regime')}
+- Sentiment: {labels.get('sentiment_regime')}
+- Technical: {labels.get('technical_regime')}
+
+请按以下固定框架输出（必须按序、标题一致）：
+
+1) 数据完整性与异常检查
+- 指出缺失项（如 put/call、calendar 403 等）以及这些缺失对结论的影响。
+- 标注你认为最不可信/最需复核的数据点，并说明原因（例如数据源、口径、滞后）。
+
+2) 模块内深度解读（逐模块，强调“内部数据关联” + 与 regime 的一致性）
+2.1 Fundamentals（利率曲线/政策预期/美元/关键宏观事件）
+- 解释 2Y、10Y、期限利差、FFR-2Y 的相互关系（政策 vs 市场定价）。
+- 结合 Real10Y 与 10Y breakeven（若有）判断“实际利率/通胀预期”对美元与黄金的含义。
+- 用 3-5 条要点给出该模块结论，并用一句话判断其对 risk assets 的方向性影响。
+
+2.2 Liquidity（WALCL/RRP/TGA/Net Liquidity、信用条件）
+- 分解 Net Liquidity 的驱动（WALCL、RRP、TGA）与近 4 周变化。
+- 结合信用指标（HYG/IEI 及 OAS 若有）给出资金面/信用面的压力方向。
+
+2.3 Sentiment（FGI/VIX term structure/put-call/风险价差）
+- 检查 FGI、VIX 与 VIX3M 的组合是否一致（例如 contango/ backwardation）。
+- 将 put/call（若有）与其它风险指标交叉验证，指出是否出现“情绪与价格背离”。
+
+2.4 Technicals（趋势/波动/宽度/广度/风格）
+- 基于 MA 距离、ATR%、boll width、trend label 判断“趋势强度 vs 震荡”。
+- 用 breadth（RSP-SPX）与风格比（XLK/XLP）解释市场内部结构（集中度/轮动）。
+
+3) 跨模块综合（相关性/驱动/一致性评分）
+- 用一段话总结：利率/美元/黄金、流动性、情绪、技术面是否“同向确认”还是“相互打架”。
+- 列出 3 条最关键的跨资产链条（例如：Real yields → USD → Gold；Net Liquidity → Equities/Crypto；Curve → Small caps）。
+- 给出一个“regime 一致性评分”（0-100，主观即可），并解释评分依据。
+
+4) 整体趋势判断与场景（专业策略框架）
+- Base case（1-2 周）：给出趋势判断（risk-on/risk-off/震荡）与 2-3 个可观察触发条件。
+- 1-3 个月：给出更中期的主线（政策/增长/通胀/流动性），并指出最大的风险变量。
+- Bull/Bear 备选场景：各写 2-3 条触发条件 + 1 条应对（仓位/对冲/择时原则）。
+
+5) 交易与风控要点（不要求具体标的，但要可执行）
+- 列出 3 条“该做/不该做”的原则（例如追涨/逢低/对冲/杠杆）。
+- 列出 3 个你会重点盯的 next-step 数据或新闻（优先来自 Key events / Top news）。
+
+输出要求：
+- 使用中文；要点化为主，避免空话。
+- 不要引用外部资料；不得补造数据。
+""".strip()
+
+    return {"system_prompt": system_prompt, "user_prompt": user_prompt}
 
 
 @app.get("/health")
@@ -925,6 +1146,44 @@ async def get_context(date: Optional[str] = Query(None, description="YYYY-MM-DD,
     labels = assign_labels(modules)
     prompt_context = build_prompt_context(modules, labels)
     return {**modules, "date": date_str, "labels": labels, "prompt_context": prompt_context}
+
+
+@app.get("/v2/prompt")
+async def get_prompt(
+    date: Optional[str] = Query(None, description="YYYY-MM-DD, default today"),
+    include_context: bool = Query(True, description="是否返回完整 context（modules）"),
+) -> Dict[str, Any]:
+    """返回可直接用于 LLM 的 system/user prompts（并可选携带 context）。
+
+    设计目的：让 Dify 仅通过 HTTP 调用即可拿到“数据 + 固定分析框架提示词”。
+    """
+    target_date = _parse_date(date)
+    date_str = target_date.isoformat()
+
+    try:
+        fundamentals = fetch_fundamentals(date_str)
+        liquidity = fetch_liquidity(date_str)
+        sentiment = fetch_sentiment(date_str)
+        technicals = fetch_technicals(date_str)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.exception("Failed to build prompt")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    modules = {
+        "fundamentals": fundamentals,
+        "liquidity": liquidity,
+        "sentiment": sentiment,
+        "technicals": technicals,
+    }
+    labels = assign_labels(modules)
+    prompts = build_llm_prompts(date_str, modules, labels)
+    resp: Dict[str, Any] = {"date": date_str, "labels": labels, **prompts}
+    if include_context:
+        resp["context"] = modules
+        resp["prompt_context"] = build_prompt_context(modules, labels)
+    return resp
 
 
 if __name__ == "__main__":
