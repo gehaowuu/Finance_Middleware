@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+pandas
+numpy
+requests
+yfinance
+fredapi
+feedparser
+python-dotenv
+tradingeconomics
+fear-greed-index
