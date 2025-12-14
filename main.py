@@ -2,9 +2,9 @@ import os
 import logging
 import time
 import json
-import re
+import io
 import datetime as dt
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from io import StringIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,26 +13,282 @@ import pandas as pd
 import requests
 import yfinance as yf
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, Cookie, Response, Header, Body
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import secrets
 from fredapi import Fred
+from google import genai
+from google.genai import types
 
-
-load_dotenv()
+# 确保无论从哪里启动（uvicorn/app-dir）都能加载到同目录下的 .env
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_BASE_DIR, ".env"))
 
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Finance Middleware", version="0.1.0")
 
+# -----------------------------------------------------------------------------
+# CORS (给前端调用用)
+#
+# 浏览器环境（Render 静态站点/自建前端）请求后端通常是跨域的，需要开启 CORS。
+# 生产环境建议把 CORS_ALLOW_ORIGINS 设置为你的前端域名列表（逗号分隔）。
+#
+# 例：
+# - CORS_ALLOW_ORIGINS=https://your-frontend.onrender.com,https://www.yourdomain.com
+#
+CORS_ALLOW_ORIGINS_RAW = (os.getenv("CORS_ALLOW_ORIGINS") or "").strip()
+if CORS_ALLOW_ORIGINS_RAW:
+    CORS_ALLOW_ORIGINS = [o.strip() for o in CORS_ALLOW_ORIGINS_RAW.split(",") if o.strip()]
+else:
+    # 默认放开，方便本地/快速联调；上线请务必收紧
+    CORS_ALLOW_ORIGINS = ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=False,  # 本项目推荐前端用 Bearer token；跨站 cookie 在现代浏览器更容易踩坑
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -----------------------------------------------------------------------------
+# Session & Snapshot Management
+#
+# The original middleware exposed only unauthenticated endpoints.  To prevent
+# anyone on the public internet from exhausting your data providers or AI
+# quotas, this patch introduces a simple password‐based login.  Upon
+# successful login a secure random token is issued and stored in memory.
+# Subsequent protected endpoints require the session cookie.  See `/auth/login`
+# and `require_auth()` below for details.
+
+# In addition, a snapshot cache is maintained to avoid recomputing the same
+# market snapshot repeatedly.  Each snapshot stores the raw modules, the
+# heuristic labels and a set of lightweight signals/data quality summaries
+# intended for LLM consumption.
+
+APP_PASSWORD = os.getenv("APP_PASSWORD")
+
+# In-memory session store: maps session token to a dictionary containing
+# metadata (creation time).  In a real application you might persist this
+# elsewhere or implement expiry.  Here we keep it simple.
+_sessions: Dict[str, Dict[str, Any]] = {}
+
+# In-memory snapshot cache: maps snapshot_id to a snapshot object.  A snapshot
+# contains the date, modules, labels, signals, heuristic labels and data
+# quality flags.  Snapshots are keyed by a random id so they can be
+# referenced later for LLM analysis without recomputation.
+_snapshot_cache: Dict[str, Dict[str, Any]] = {}
+
+
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 TE_CLIENT_KEY = os.getenv("TE_CLIENT_KEY")
 TE_CLIENT_SECRET = os.getenv("TE_CLIENT_SECRET")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+GEMINI_DEFAULT_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-3-pro-preview").strip() or "gemini-3-pro-preview"
+GEMINI_DEFAULT_THINKING_LEVEL = (os.getenv("GEMINI_THINKING_LEVEL") or "high").strip().lower()
+if GEMINI_DEFAULT_THINKING_LEVEL not in {"low", "high"}:
+    GEMINI_DEFAULT_THINKING_LEVEL = "high"
 
 fred_client: Optional[Fred] = Fred(api_key=FRED_API_KEY) if FRED_API_KEY else None
+
+# Gemini API 配置
+gemini_client: Optional[Any] = None
+if GEMINI_API_KEY:
+    try:
+        try:
+            gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        except TypeError:
+            # 兼容部分版本不支持显式 api_key 参数的情况
+            # 新版 SDK 默认读取环境变量 GOOGLE_API_KEY；这里兼容你当前的 GEMINI_API_KEY 命名
+            os.environ.setdefault("GOOGLE_API_KEY", GEMINI_API_KEY)
+            gemini_client = genai.Client()
+        logging.info(f"Gemini API 已配置成功，使用模型: {GEMINI_DEFAULT_MODEL}")
+    except Exception as e:
+        logging.warning(f"Gemini API 配置失败: {e}")
+        gemini_client = None
+else:
+    logging.warning("未检测到 GEMINI_API_KEY，LLM 分析功能将不可用。")
 
 if not FRED_API_KEY:
     logging.warning("未检测到 FRED_API_KEY，FRED 数据将被跳过。")
 if not TE_CLIENT_KEY or not TE_CLIENT_SECRET:
     logging.warning("未检测到 TradingEconomics 凭证，经济日历将返回空列表。")
+
+
+# -------- Gemini LLM helpers --------
+def call_gemini(
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 1.0,
+    max_tokens: int = 10240,
+    model: Optional[str] = None,
+    thinking_level: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    调用 Gemini API 生成分析内容。
+    
+    返回 (response_text, error_message)
+    - 成功时: (回复内容, None)
+    - 失败时: (None, 错误信息)
+    """
+    if not gemini_client:
+        return None, "Gemini API 未配置（缺少 GEMINI_API_KEY）"
+    
+    try:
+        full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
+        
+        model_name = (model or GEMINI_DEFAULT_MODEL).strip() or GEMINI_DEFAULT_MODEL
+        tl = (thinking_level or GEMINI_DEFAULT_THINKING_LEVEL).strip().lower()
+        if tl not in {"low", "high"}:
+            tl = GEMINI_DEFAULT_THINKING_LEVEL
+
+        # 优先使用强类型 Config；如遇到版本差异，再回退到 dict
+        try:
+            cfg = types.GenerateContentConfig(
+                temperature=temperature,
+                top_p=0.95,
+                top_k=40,
+                max_output_tokens=max_tokens,
+                thinking_config=types.ThinkingConfig(thinking_level=tl),
+            )
+        except Exception:
+            cfg = {
+                "temperature": temperature,
+                "top_p": 0.95,
+                "top_k": 40,
+                "max_output_tokens": max_tokens,
+                "thinking_config": {"thinking_level": tl},
+            }
+
+        response = gemini_client.models.generate_content(
+            model=model_name,
+            contents=full_prompt,
+            config=cfg,
+        )
+        
+        if getattr(response, "text", None):
+            return response.text, None
+        else:
+            # 检查是否有安全过滤
+            prompt_feedback = getattr(response, "prompt_feedback", None)
+            if prompt_feedback:
+                return None, f"内容被安全过滤: {prompt_feedback}"
+            # Gemini 3 可能会消耗较多“思考 token”。如果 max_output_tokens 太小，会出现候选返回但无可见文本。
+            try:
+                cands = getattr(response, "candidates", None) or []
+                fr = getattr(cands[0], "finish_reason", None) if cands else None
+                if fr and "MAX_TOKENS" in str(fr):
+                    usage = getattr(response, "usage_metadata", None)
+                    thoughts = getattr(usage, "thoughts_token_count", None) if usage else None
+                    return (
+                        None,
+                        f"Gemini 输出为空（max_output_tokens 可能过小，thoughts_token_count={thoughts}）。"
+                        "请调大 max_tokens 或降低 thinking_level。",
+                    )
+            except Exception:
+                pass
+            return None, "Gemini 返回空响应"
+            
+    except Exception as e:
+        logging.error(f"Gemini API 调用失败: {e}")
+        return None, f"Gemini API 调用失败: {str(e)}"
+
+
+def call_gemini_chat(
+    system_prompt: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 1.0,
+    max_tokens: int = 10240,
+    model: Optional[str] = None,
+    thinking_level: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    调用 Gemini API 进行多轮对话。
+    
+    messages 格式: [{"role": "user"|"assistant", "content": "..."}]
+    
+    返回 (response_text, error_message)
+    """
+    if not gemini_client:
+        return None, "Gemini API 未配置（缺少 GEMINI_API_KEY）"
+    
+    try:
+        model_name = (model or GEMINI_DEFAULT_MODEL).strip() or GEMINI_DEFAULT_MODEL
+        tl = (thinking_level or GEMINI_DEFAULT_THINKING_LEVEL).strip().lower()
+        if tl not in {"low", "high"}:
+            tl = GEMINI_DEFAULT_THINKING_LEVEL
+
+        try:
+            cfg = types.GenerateContentConfig(
+                temperature=temperature,
+                top_p=0.95,
+                top_k=40,
+                max_output_tokens=max_tokens,
+                thinking_config=types.ThinkingConfig(thinking_level=tl),
+            )
+        except Exception:
+            cfg = {
+                "temperature": temperature,
+                "top_p": 0.95,
+                "top_k": 40,
+                "max_output_tokens": max_tokens,
+                "thinking_config": {"thinking_level": tl},
+            }
+
+        # 重要：该服务端是“无状态”的。每次请求都会重建 history，因此 system_prompt 必须每次都注入，
+        # 否则用户第二轮开始就会丢失“市场快照上下文”。
+        contents: List[Dict[str, Any]] = [
+            {"role": "user", "parts": [{"text": system_prompt}]}
+        ]
+        for msg in messages:
+            role = "user" if msg.get("role") == "user" else "model"
+            contents.append({"role": role, "parts": [{"text": msg.get("content", "")}]})
+
+        try:
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=cfg,
+            )
+        except Exception:
+            # 兼容：若 SDK 版本对 structured contents 支持不一致，则回退到拼接文本
+            lines: List[str] = [system_prompt, "---"]
+            for msg in messages:
+                r = "USER" if msg.get("role") == "user" else "ASSISTANT"
+                lines.append(f"{r}: {msg.get('content', '')}")
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents="\n".join(lines),
+                config=cfg,
+            )
+        
+        if getattr(response, "text", None):
+            return response.text, None
+        else:
+            prompt_feedback = getattr(response, "prompt_feedback", None)
+            if prompt_feedback:
+                return None, f"内容被安全过滤: {prompt_feedback}"
+            try:
+                cands = getattr(response, "candidates", None) or []
+                fr = getattr(cands[0], "finish_reason", None) if cands else None
+                if fr and "MAX_TOKENS" in str(fr):
+                    usage = getattr(response, "usage_metadata", None)
+                    thoughts = getattr(usage, "thoughts_token_count", None) if usage else None
+                    return (
+                        None,
+                        f"Gemini 输出为空（max_output_tokens 可能过小，thoughts_token_count={thoughts}）。"
+                        "请调大 max_tokens 或降低 thinking_level。",
+                    )
+            except Exception:
+                pass
+            return None, "Gemini 返回空响应"
+            
+    except Exception as e:
+        logging.error(f"Gemini Chat API 调用失败: {e}")
+        return None, f"Gemini API 调用失败: {str(e)}"
+
 
 NEWS_QUERY = "Federal Reserve OR CPI OR inflation"
 NEWS_RSS = (
@@ -45,6 +301,13 @@ PCR_URLS = [
     "https://cdn.cboe.com/data/PUT/pc.csv",
     "https://cdn.cboe.com/resources/options/volume_and_put_call_ratios/totalpc.csv",
 ]
+
+# CBOE Put/Call CSV URLs (新增)
+CBOE_PCR_URLS = {
+    "total": "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/totalpc.csv",
+    "equity": "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/equitypc.csv",
+    "vix": "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/vixpc.csv",
+}
 
 DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 TE_CACHE_PATH = os.getenv("TE_CACHE_PATH", "cache_te_calendar.json")
@@ -259,81 +522,94 @@ EVENT_RELEASES = [
 ]
 
 
-def fred_release_last_next(release_id: int, timeout: int = 15) -> Tuple[Optional[str], Optional[str]]:
-    """返回 (last_release_date, next_scheduled_release_date)（按日历日期）。
-
-    说明：FRED 的 /fred/release/dates 支持 include_release_dates_with_no_data=true，可返回未来排期。
-    为避免一次性拉全量历史，这里取最近 N 条（desc），再从中计算 last/next。
-    """
+def fred_last_release_date(release_id: int, timeout: int = 15) -> Optional[str]:
     if not FRED_API_KEY:
-        return None, None
+        return None
     url = "https://api.stlouisfed.org/fred/release/dates"
     params = {
         "api_key": FRED_API_KEY,
         "file_type": "json",
         "release_id": release_id,
         "sort_order": "desc",
-        "limit": 200,
-        "include_release_dates_with_no_data": "true",
+        "limit": 1,
     }
     try:
-        r = requests.get(url, params=params, timeout=timeout, headers=DEFAULT_HEADERS)
+        r = requests.get(url, params=params, timeout=timeout)
         r.raise_for_status()
         data = r.json() or {}
         dates = data.get("release_dates", []) or []
-        if not dates:
-            return None, None
-
-        today = dt.date.today()
-        parsed: List[dt.date] = []
-        for row in dates:
-            ds = row.get("date")
-            if not ds:
-                continue
-            try:
-                parsed.append(dt.datetime.strptime(ds, "%Y-%m-%d").date())
-            except Exception:
-                continue
-
-        if not parsed:
-            return None, None
-
-        last_past = max((d for d in parsed if d <= today), default=None)
-        next_future = min((d for d in parsed if d >= today), default=None)
-        return (
-            last_past.isoformat() if last_past else None,
-            next_future.isoformat() if next_future else None,
-        )
+        if dates:
+            return dates[0].get("date")
     except Exception:
-        return None, None
+        return None
+    return None
 
 
 def build_events_fred(timeout: int = 15) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     for item in EVENT_RELEASES:
-        last_d, next_d = fred_release_last_next(item["release_id"], timeout=timeout)
-        if last_d or next_d:
-            events.append(
-                {
-                    "event": item["name"],
-                    "last_release_date": last_d,
-                    "next_release_date": next_d,
-                    "source": "FRED",
-                }
-            )
+        d = fred_last_release_date(item["release_id"], timeout=timeout)
+        if d:
+            events.append({"event": item["name"], "last_release_date": d, "source": "FRED"})
     return events
 
 
 # -------- CBOE PCR helpers --------
+def _pick_col(df: pd.DataFrame, keywords: List[str], default_idx: int = 0) -> Optional[str]:
+    """根据关键词查找列名，找不到时返回 default_idx 对应的列。"""
+    cols = list(df.columns)
+    for k in keywords:
+        for c in cols:
+            if k in str(c).lower():
+                return c
+    return cols[default_idx] if cols else None
+
+
+def _read_cboe_csv_table(raw_csv: str, header_token: str = "DATE", max_scan_rows: int = 30) -> pd.DataFrame:
+    """
+    CBOE 的部分 CSV 前几行是免责声明/元数据，真正表头通常在包含 DATE 的那一行。
+    这里自动扫描并抽取表格部分，避免把免责声明当成 header 导致列名/取值错位。
+    """
+    try:
+        df_raw = pd.read_csv(io.StringIO(raw_csv), header=None)
+    except Exception:
+        # 兜底：让 pandas 自己解析（可能失败，但不要在这里吞异常）
+        return pd.read_csv(io.StringIO(raw_csv))
+
+    header_idx: Optional[int] = None
+    scan_n = min(len(df_raw), max_scan_rows)
+    for idx in range(scan_n):
+        row_vals = [str(v).strip().upper() for v in df_raw.iloc[idx].tolist()]
+        if header_token.upper() in row_vals:
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        df = pd.read_csv(io.StringIO(raw_csv))
+        df.columns = [str(c).strip() for c in df.columns]
+        return df.dropna(how="all")
+
+    columns: List[str] = []
+    for i, v in enumerate(df_raw.iloc[header_idx].tolist()):
+        name = str(v).strip()
+        if not name or name.lower() == "nan":
+            name = f"col_{i}"
+        columns.append(name)
+
+    df = df_raw.iloc[header_idx + 1 :].copy()
+    df.columns = columns
+    df.columns = [str(c).strip() for c in df.columns]
+    return df.dropna(how="all")
+
+
 def _read_csv_url(url: str, timeout: int = 15) -> pd.DataFrame:
-    # 部分 CDN/站点会对“非浏览器 UA”返回 403/400，因此统一使用浏览器风格 headers。
-    headers = {**DEFAULT_HEADERS, "Accept": "text/csv,*/*;q=0.9"}
+    headers = {"User-Agent": "finance-middleware/1.0", "Accept": "text/csv,*/*"}
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return pd.read_csv(StringIO(r.text))
 
 def _download_text(url: str, timeout: int = 15) -> str:
-    headers = {**DEFAULT_HEADERS, "Accept": "text/csv,*/*;q=0.9"}
+    headers = {"User-Agent": "finance-middleware/1.0", "Accept": "text/csv,*/*"}
     r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.text
@@ -347,12 +623,7 @@ def _find_header_line_index(lines: List[str], header_token: str) -> Optional[int
 
 
 def _parse_pc_csv(text: str) -> Tuple[float, str]:
-    # CBOE 的 CSV 在不同时期/不同文件上可能存在：
-    # - 顶部说明行（非 CSV header）
-    # - 无 header，直接从数据行开始（例如含 "TOTAL,P/C Ratio 11/1/2006,..."）
-    # - 不同日期列名（Date / Trade_date）
-    # 因此解析逻辑需尽量宽容。
-    lines = [ln.strip("\ufeff") for ln in text.splitlines()]
+    lines = text.splitlines()
     # 1) Date-based tables (totalpc/equitypc)
     idx = _find_header_line_index(lines, "Date,")
     if idx is not None:
@@ -405,54 +676,7 @@ def _parse_pc_csv(text: str) -> Tuple[float, str]:
         last = df.iloc[-1]
         return float(last[ratio_col]), last[date_col].date().isoformat()
 
-    # 3) 无显式表头：逐行提取日期与最后一列（通常为 ratio）
-    date_mdY = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b")
-    date_Ymd = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
-    candidates: List[Tuple[dt.date, float]] = []
-    for line in lines:
-        if not line or line.startswith("#"):
-            continue
-        parts = [p.strip() for p in line.split(",") if p.strip()]
-        if len(parts) < 2:
-            continue
-
-        # 在前两列中找日期（以及可能夹在字符串中的日期）
-        date_token: Optional[str] = None
-        for token in parts[:2]:
-            m = date_Ymd.search(token)
-            if m:
-                date_token = m.group(1)
-                break
-            m = date_mdY.search(token)
-            if m:
-                date_token = m.group(1)
-                break
-        if not date_token:
-            continue
-
-        # 解析日期
-        try:
-            if "-" in date_token:
-                d = dt.datetime.strptime(date_token, "%Y-%m-%d").date()
-            else:
-                d = dt.datetime.strptime(date_token, "%m/%d/%Y").date()
-        except Exception:
-            continue
-
-        # 默认取最后一列为 ratio（可能含空格/符号）
-        raw_ratio = parts[-1]
-        raw_ratio = re.sub(r"[^0-9eE\-\.]+", "", raw_ratio)
-        try:
-            ratio = float(raw_ratio)
-        except Exception:
-            continue
-        candidates.append((d, ratio))
-
-    if candidates:
-        d, ratio = max(candidates, key=lambda x: x[0])
-        return float(ratio), d.isoformat()
-
-    raise ValueError("Unknown CBOE CSV format (no Date,/Trade_date header found and no date rows parsed).")
+    raise ValueError("Unknown CBOE CSV format (no Date,/Trade_date header found).")
 
 
 def get_cboe_put_call_ratio(timeout: int = 15) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -482,6 +706,272 @@ def get_cboe_put_call_ratio(timeout: int = 15) -> Tuple[Optional[Dict[str, Any]]
             last_error = f"{url} failed: {e}"
             continue
     return None, last_error or "CBOE put/call fetch failed."
+
+
+def fetch_put_call_from_cboe_equitypc(
+    url: str = "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/equitypc.csv",
+    max_age_days: int = 10,
+) -> Dict[str, Any]:
+    """
+    首选：读取 CBOE 官方 equitypc.csv，返回最新值与 5/20 日均值。
+    - 自动跳过免责声明/元数据行，避免 ratio/date 列误判
+    - 强制 pd.to_datetime，彻底消除 numpy.int64.date() 报错链路
+    - 如果数据过旧（> max_age_days），直接抛错触发上层兜底
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+
+    df = _read_cboe_csv_table(r.text, header_token="DATE", max_scan_rows=30)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 自动识别日期列
+    date_col: Optional[str] = None
+    for c in df.columns:
+        cl = c.lower().strip()
+        if cl in ("date", "dates", "trade date", "tradedate"):
+            date_col = c
+            break
+    if date_col is None:
+        date_col = df.columns[0] if len(df.columns) else None
+    if not date_col:
+        raise ValueError("equitypc.csv: date column not found")
+
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col]).sort_values(date_col)
+
+    # 自动识别 ratio 列（注意避开 date 列，避免把 DATE 当 ratio 转成纳秒整数）
+    ratio_col: Optional[str] = None
+    for c in df.columns:
+        if c == date_col:
+            continue
+        if "ratio" in c.lower():
+            ratio_col = c
+            break
+
+    # 如果没有 ratio 列，就用 PUT/CALL 自己算
+    if ratio_col is None:
+        put_col = next((c for c in df.columns if c.lower().strip() == "put"), None)
+        call_col = next((c for c in df.columns if c.lower().strip() == "call"), None)
+        if put_col and call_col:
+            df["pc_ratio_calc"] = pd.to_numeric(df[put_col], errors="coerce") / pd.to_numeric(
+                df[call_col], errors="coerce"
+            )
+            ratio_col = "pc_ratio_calc"
+        else:
+            raise ValueError(f"equitypc.csv: ratio/put/call column not found. columns={df.columns.tolist()}")
+
+    df[ratio_col] = pd.to_numeric(df[ratio_col], errors="coerce")
+    df = df.dropna(subset=[ratio_col])
+
+    if df.empty:
+        raise ValueError("equitypc.csv parsed empty (maybe HTML/blocked or schema changed)")
+
+    latest = df.iloc[-1]
+    latest_dt = latest[date_col]
+
+    tail5 = df.tail(5)
+    tail20 = df.tail(20)
+
+    def _mean(series: pd.Series) -> Optional[float]:
+        s = pd.to_numeric(series, errors="coerce").dropna()
+        return float(s.mean()) if not s.empty else None
+
+    latest_ratio = float(latest[ratio_col]) if pd.notna(latest[ratio_col]) else None
+    latest_date = latest_dt.strftime("%Y-%m-%d") if hasattr(latest_dt, "strftime") else None
+
+    if latest_ratio is None or latest_date is None:
+        raise ValueError("equitypc.csv: failed to parse valid ratio/date")
+
+    # 数据新鲜度校验：过旧直接判失败，交给上层兜底
+    try:
+        age_days = (datetime.utcnow().date() - latest_dt.date()).days  # type: ignore[union-attr]
+    except Exception:
+        age_days = 9999
+    if age_days > max_age_days:
+        raise ValueError(f"equitypc.csv stale: latest={latest_date}, age_days={age_days}")
+
+    return {
+        "put_call_ratio": latest_ratio,
+        "put_call_ratio_5d": _mean(tail5[ratio_col]),
+        "put_call_ratio_20d": _mean(tail20[ratio_col]),
+        "put_call_source": "cboe-equitypc",
+        "put_call_date": latest_date,
+        "put_call_note": None,
+        "put_call_url": url,
+    }
+
+
+def fetch_put_call_from_cboe_daily_options_json(lookback_days: int = 45) -> Dict[str, Any]:
+    """
+    兜底：抓 Cboe daily 页面背后的 JSON 数据文件（比直接扒 HTML 稳定）。
+    文件形如：
+      https://cdn.cboe.com/data/us/options/market_statistics/daily/YYYY-MM-DD_daily_options
+    这里会回溯 lookback_days，找到最近 20 个"有 EQUITY PUT/CALL RATIO 的交易日"，并计算 5d/20d 均值。
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    base = "https://cdn.cboe.com/data/us/options/market_statistics/daily/{dt}_daily_options"
+
+    samples: List[Tuple[str, float]] = []
+    for i in range(lookback_days):
+        dt_str = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
+        url = base.format(dt=dt_str)
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+        except Exception:
+            continue
+
+        ratio_val: Optional[float] = None
+        ratios = data.get("ratios") if isinstance(data, dict) else None
+        if isinstance(ratios, list):
+            for item in ratios:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).strip().upper()
+                if "EQUITY PUT/CALL RATIO" in name:
+                    try:
+                        ratio_val = float(item.get("value"))
+                    except Exception:
+                        ratio_val = None
+                    break
+
+        if ratio_val is None:
+            continue
+
+        samples.append((dt_str, ratio_val))
+        if len(samples) >= 20:
+            break
+
+    if not samples:
+        raise ValueError(f"cboe daily_options: EQUITY PUT/CALL RATIO not found within last {lookback_days} days")
+
+    latest_date, latest_ratio = samples[0]
+    values = [v for _, v in samples]
+
+    def _avg(vals: List[float]) -> Optional[float]:
+        if not vals:
+            return None
+        return float(sum(vals) / len(vals))
+
+    out = {
+        "put_call_ratio": float(latest_ratio),
+        "put_call_ratio_5d": _avg(values[:5]) if len(values) >= 5 else None,
+        "put_call_ratio_20d": _avg(values[:20]) if len(values) >= 20 else None,
+        "put_call_source": "cboe-daily-options-json",
+        "put_call_date": latest_date,
+        "put_call_note": None if len(values) >= 20 else f"only collected {len(values)} trading days",
+        "put_call_url": base.format(dt=latest_date),
+    }
+    return out
+
+
+def get_put_call_from_cboe(kind: str = "total", max_age_days: int = 10) -> Dict[str, Any]:
+    """
+    直接从 CBOE 官方 CSV 读取 put/call，返回最新值与 5/20 日均值，自动校验数据新鲜度。
+    作为最后兜底使用。
+    """
+    url = CBOE_PCR_URLS.get(kind, CBOE_PCR_URLS["total"])
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+
+        df = _read_cboe_csv_table(r.text, header_token="DATE", max_scan_rows=30)
+        if df.empty:
+            return {
+                "put_call_ratio": None,
+                "put_call_date": None,
+                "put_call_ratio_5d": None,
+                "put_call_ratio_20d": None,
+                "put_call_source": f"cboe-{kind}",
+                "put_call_note": "CBOE CSV empty",
+                "put_call_url": url,
+            }
+
+        date_col = _pick_col(df, keywords=["date"], default_idx=0)
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col]).sort_values(date_col)
+        if df.empty:
+            return {
+                "put_call_ratio": None,
+                "put_call_date": None,
+                "put_call_ratio_5d": None,
+                "put_call_ratio_20d": None,
+                "put_call_source": f"cboe-{kind}",
+                "put_call_note": "CBOE CSV date parse failed",
+                "put_call_url": url,
+            }
+
+        ratio_col = _pick_col(df, keywords=["p/c", "put/call", "ratio"], default_idx=1)
+        if ratio_col == date_col:
+            # 避免把 DATE 列当成 ratio 列，导致 date 列被数值化后出现 numpy.int64.date() 报错
+            ratio_col = next(
+                (c for c in df.columns if c != date_col and ("ratio" in str(c).lower() or "p/c" in str(c).lower())),
+                None,
+            )
+            if ratio_col is None and len(df.columns) > 1:
+                ratio_col = df.columns[1]
+            if ratio_col is None:
+                return {
+                    "put_call_ratio": None,
+                    "put_call_date": None,
+                    "put_call_ratio_5d": None,
+                    "put_call_ratio_20d": None,
+                    "put_call_source": f"cboe-{kind}",
+                    "put_call_note": "CBOE CSV ratio column missing",
+                    "put_call_url": url,
+                }
+        df[ratio_col] = pd.to_numeric(df[ratio_col], errors="coerce")
+        df = df.dropna(subset=[ratio_col])
+        if df.empty:
+            return {
+                "put_call_ratio": None,
+                "put_call_date": None,
+                "put_call_ratio_5d": None,
+                "put_call_ratio_20d": None,
+                "put_call_source": f"cboe-{kind}",
+                "put_call_note": "CBOE CSV ratio parse failed",
+                "put_call_url": url,
+            }
+
+        latest = df.iloc[-1]
+        latest_ts = pd.to_datetime(latest[date_col], errors="coerce")
+        latest_ratio = float(latest[ratio_col])
+
+        tail = df.tail(30)
+        ratio_5d = float(tail[ratio_col].tail(5).mean()) if len(tail) >= 5 else None
+        ratio_20d = float(tail[ratio_col].tail(20).mean()) if len(tail) >= 20 else None
+
+        latest_date = latest_ts.strftime("%Y-%m-%d") if pd.notna(latest_ts) else None
+        age_days = (datetime.now(timezone.utc).date() - latest_ts.date()).days if pd.notna(latest_ts) else 9999
+        note = None
+        if age_days > max_age_days:
+            note = f"CBOE PCR feed stale: latest={latest_date}, age_days={age_days}"
+
+        return {
+            "put_call_ratio": latest_ratio,
+            "put_call_date": latest_date,
+            "put_call_ratio_5d": ratio_5d,
+            "put_call_ratio_20d": ratio_20d,
+            "put_call_source": f"cboe-{kind}",
+            "put_call_note": note,
+            "put_call_url": url,
+        }
+
+    except Exception as e:
+        return {
+            "put_call_ratio": None,
+            "put_call_date": None,
+            "put_call_ratio_5d": None,
+            "put_call_ratio_20d": None,
+            "put_call_source": f"cboe-{kind}",
+            "put_call_note": f"fetch failed: {e}",
+            "put_call_url": url,
+        }
 
 
 def _parse_date(date_str: Optional[str]) -> date:
@@ -615,20 +1105,10 @@ def fetch_fundamentals(date_str: str) -> Dict[str, Any]:
         "dgs2": None,
         "dgs10": None,
         "fedfunds": None,
-        "effr": None,
-        "effr_date": None,
         "term_spread": None,
         "ffr_minus_2y": None,
         "fedfunds_date": None,
         "ffr_minus_2y_note": None,
-        "real10y": None,
-        "real10y_date": None,
-        "breakeven10y": None,
-        "breakeven10y_date": None,
-        "ig_oas": None,
-        "ig_oas_date": None,
-        "hy_oas": None,
-        "hy_oas_date": None,
     }
     if fred_client:
         try:
@@ -641,18 +1121,12 @@ def fetch_fundamentals(date_str: str) -> Dict[str, Any]:
         except Exception as exc:
             logging.warning("Failed to fetch FRED rates: %s", exc)
 
-    # Policy rate：分别返回 EFFR 与 FEDFUNDS（同时以 EFFR 优先作为 fedfunds 字段）
-    effr_obs, _ = fred_latest_observation("EFFR")
-    if effr_obs:
-        rates["effr"] = effr_obs.get("value")
-        rates["effr_date"] = effr_obs.get("date")
-
-    ff_obs = effr_obs
-    if not ff_obs:
-        ff_obs, _ = fred_latest_observation("FEDFUNDS")
+    # Fed Funds：优先 EFFR，再退 FEDFUNDS，取最近一次有效值
+    effr, _ = fred_latest_observation("EFFR")
+    ff_obs, ff_note = (effr, None) if effr else fred_latest_observation("FEDFUNDS")
     if ff_obs:
-        rates["fedfunds"] = ff_obs.get("value")
-        rates["fedfunds_date"] = ff_obs.get("date")
+        rates["fedfunds"] = ff_obs["value"]
+        rates["fedfunds_date"] = ff_obs["date"]
     else:
         rates["fedfunds"] = None
         rates["fedfunds_date"] = None
@@ -666,24 +1140,6 @@ def fetch_fundamentals(date_str: str) -> Dict[str, Any]:
     dgs10_obs, _ = fred_latest_observation("DGS10")
     rates["dgs2_date"] = dgs2_obs["date"] if dgs2_obs else None
     rates["dgs10_date"] = dgs10_obs["date"] if dgs10_obs else None
-
-    # 额外 FRED 指标：实值利率 / 通胀预期 / 信用利差（用于更稳定的宏观与风险判断）
-    real10y_obs, _ = fred_latest_observation("DFII10")  # 10Y TIPS real yield
-    if real10y_obs:
-        rates["real10y"] = real10y_obs.get("value")
-        rates["real10y_date"] = real10y_obs.get("date")
-    breakeven10y_obs, _ = fred_latest_observation("T10YIE")  # 10Y breakeven inflation
-    if breakeven10y_obs:
-        rates["breakeven10y"] = breakeven10y_obs.get("value")
-        rates["breakeven10y_date"] = breakeven10y_obs.get("date")
-    ig_oas_obs, _ = fred_latest_observation("BAMLC0A0CM")
-    if ig_oas_obs:
-        rates["ig_oas"] = ig_oas_obs.get("value")
-        rates["ig_oas_date"] = ig_oas_obs.get("date")
-    hy_oas_obs, _ = fred_latest_observation("BAMLH0A0HYM2")
-    if hy_oas_obs:
-        rates["hy_oas"] = hy_oas_obs.get("value")
-        rates["hy_oas_date"] = hy_oas_obs.get("date")
 
     dxy_value, dxy_ticker = _first_available_price(
         ["DX-Y.NYB", "DXY", "USDOLLAR"], target, start, target + timedelta(days=1)
@@ -800,17 +1256,19 @@ def fetch_sentiment(date_str: str) -> Dict[str, Any]:
         else:
             term_structure = "flat"
 
-    put_call_ratio = None
-    put_call_source = None
-    put_call_date = None
-    put_call_note = None
-    pcr, pcr_note = get_cboe_put_call_ratio()
-    if pcr:
-        put_call_ratio = pcr["value"]
-        put_call_source = pcr["source"]
-        put_call_date = pcr["date"]
-    else:
-        put_call_note = pcr_note
+    # Put/Call：优先 equitypc.csv，失败/过旧则用 daily_options JSON 兜底；再不行就退回 CBOE(total/equity) 逻辑
+    try:
+        pcr = fetch_put_call_from_cboe_equitypc()
+    except Exception as e_equitypc:
+        try:
+            pcr = fetch_put_call_from_cboe_daily_options_json()
+        except Exception as e_daily:
+            pcr = get_put_call_from_cboe("total")
+            if pcr.get("put_call_ratio") is None:
+                pcr = get_put_call_from_cboe("equity")
+            base_note = pcr.get("put_call_note")
+            extra = f"equitypc failed: {e_equitypc}; daily_options failed: {e_daily}"
+            pcr["put_call_note"] = f"{base_note}; {extra}" if base_note else extra
 
     spreads = {}
     spread_pairs = [("SPY", "XLU", "spy_xlu"), ("HYG", "IEF", "hyg_ief"), ("BTC-USD", "GC=F", "btc_gold")]
@@ -829,11 +1287,13 @@ def fetch_sentiment(date_str: str) -> Dict[str, Any]:
         "vix3m": vix3m,
         "vix_term_source": vix_source,
         "term_structure": term_structure,
-        "put_call_ratio": put_call_ratio,
-        "put_call_source": put_call_source,
-        "put_call_date": put_call_date,
-        "put_call_note": put_call_note,
-        "put_call_url": pcr["url"] if pcr else None,
+        "put_call_ratio": pcr.get("put_call_ratio"),
+        "put_call_ratio_5d": pcr.get("put_call_ratio_5d"),
+        "put_call_ratio_20d": pcr.get("put_call_ratio_20d"),
+        "put_call_source": pcr.get("put_call_source"),
+        "put_call_date": pcr.get("put_call_date"),
+        "put_call_note": pcr.get("put_call_note"),
+        "put_call_url": pcr.get("put_call_url"),
         **spreads,
     }
 
@@ -954,92 +1414,475 @@ def assign_labels(modules: Dict[str, Any]) -> Dict[str, str]:
     return labels
 
 
-def build_prompt_context(modules: Dict[str, Any], labels: Dict[str, str]) -> str:
-    """根据四大模块构建面向 LLM 的提示文本。"""
-    fundamentals = modules["fundamentals"]
-    liquidity = modules["liquidity"]
-    sentiment = modules["sentiment"]
-    technicals = modules["technicals"]
+def compute_signals(modules: Dict[str, Any], labels: Dict[str, str]) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str], Dict[str, List[str]]]:
+    """
+    Compute lightweight signal summaries for each module alongside heuristic
+    labels and data quality annotations.  These summaries decouple the LLM
+    analysis from raw data structures and make it easier to reason about
+    missing fields.
 
-    news_lines = [f"- {n['title']} (source: {n.get('source')})" for n in fundamentals.get("news", [])]
+    Parameters
+    ----------
+    modules : Dict[str, Any]
+        The four top-level modules returned by fetch_fundamentals,
+        fetch_liquidity, fetch_sentiment and fetch_technicals.
+    labels : Dict[str, str]
+        Heuristic regime labels (macro/liquidity/sentiment/technical) as
+        produced by assign_labels().
 
-    # TE snapshot 与 FRED fallback 的字段不同：
-    # - TE: {country, date, category, event, actual, previous, forecast, importance}
-    # - FRED: {event, last_release_date, next_release_date}
-    event_lines: List[str] = []
-    for e in fundamentals.get("events", []) or []:
-        if e.get("event") and (e.get("last_release_date") or e.get("next_release_date")):
-            parts = []
-            if e.get("last_release_date"):
-                parts.append(f"last {e.get('last_release_date')}")
-            if e.get("next_release_date"):
-                parts.append(f"next {e.get('next_release_date')}")
-            event_lines.append(f"- {e.get('event')}: {', '.join(parts)} (source {e.get('source')})")
-            continue
+    Returns
+    -------
+    signals : dict
+        Mapping from module name to a list of signal dictionaries.  Each
+        signal has a `name`, a `value` and a `quality` field ("good" or
+        "missing").
+    heuristics : dict
+        Mapping from module name to the heuristic regime label (e.g. "Dovish").
+    data_quality : dict
+        Mapping from module name to a list of keys that were missing in the
+        original module data.  This allows the LLM to call out gaps.
+    """
+    signals: Dict[str, List[Dict[str, Any]]] = {}
+    heuristics: Dict[str, str] = {}
+    data_quality: Dict[str, List[str]] = {}
 
-        # TE snapshot (或其它 calendar 数据)
-        when = (e.get("date") or "").strip()
-        where = (e.get("country") or "").strip()
-        cat = (e.get("category") or "").strip()
-        name = (e.get("event") or "").strip()
-        label = " - ".join([x for x in [cat, name] if x]) or "(unknown event)"
-        header = " ".join([x for x in [when, where, label] if x]).strip()
-        actual = e.get("actual")
-        forecast = e.get("forecast")
-        previous = e.get("previous")
-        event_lines.append(f"- {header}: act {actual} / fcst {forecast} / prev {previous}")
-    assets = technicals.get("assets", {})
-    asset_lines = []
-    for name, data in assets.items():
-        if not data:
-            continue
-        close_val = data.get("close")
-        atr_text = _fmt_pct(data.get("atr_pct"), signed=False)
-        asset_lines.append(
-            f"- {name}: {_fmt_num(close_val, 2)} "
-            f"(MA20 {_fmt_pct(data.get('distance_ma20_pct'))} / "
-            f"MA50 {_fmt_pct(data.get('distance_ma50_pct'))} / "
-            f"MA200 {_fmt_pct(data.get('distance_ma200_pct'))}, "
-            f"ATR% {atr_text}, "
-            f"trend {data.get('trend_label')})"
-        )
-
-    prompt = [
-        "=== FUNDAMENTALS ===",
-        f"- 2Y: {_fmt_num(fundamentals.get('dgs2'), 2, '%')} | 10Y: {_fmt_num(fundamentals.get('dgs10'), 2, '%')} "
-        f"| Term spread: {_fmt_num(fundamentals.get('term_spread'), 2, '%')}",
-        f"- Fed Funds: {_fmt_num(fundamentals.get('fedfunds'), 2, '%')} | FFR-2Y: {_fmt_num(fundamentals.get('ffr_minus_2y'), 2, '%')}",
-        f"- EFFR: {_fmt_num(fundamentals.get('effr'), 2, '%')} | Real10Y: {_fmt_num(fundamentals.get('real10y'), 2, '%')} "
-        f"| 10Y BE: {_fmt_num(fundamentals.get('breakeven10y'), 2, '%')} | IG OAS: {_fmt_num(fundamentals.get('ig_oas'), 2)} "
-        f"| HY OAS: {_fmt_num(fundamentals.get('hy_oas'), 2)}",
-        f"- DXY: {_fmt_num(fundamentals.get('dxy'))} (ticker {fundamentals.get('dxy_ticker') or 'DX-Y.NYB/DXY'})",
-        f"- Key events:\n{chr(10).join(event_lines) if event_lines else '  (none, maybe credentials missing)'}",
-        f"- Top news:\n{chr(10).join(news_lines) if news_lines else '  (none)'}",
-        "",
-        "=== LIQUIDITY ===",
-        f"- Net liquidity: {_fmt_num(liquidity.get('net_liquidity'), 2, 'B')} (Δ4w {_fmt_num(liquidity.get('net_change_4w'), 2, 'B')})",
-        f"- Components: WALCL {_fmt_num(liquidity.get('walcl'), 2, 'B')} | RRP {_fmt_num(liquidity.get('rrp'), 2, 'B')} | "
-        f"TGA {_fmt_num(liquidity.get('tga'), 2, 'B')}",
-        f"- Credit ratio (HYG/IEI): {_fmt_num(liquidity.get('credit_ratio'))} (Δ20d {_fmt_num(liquidity.get('credit_change_20d'))})",
-        "",
-        "=== SENTIMENT ===",
-        f"- Fear & Greed: {sentiment.get('fgi_score')} ({sentiment.get('fgi_rating')}, source={sentiment.get('fgi_source')})",
-        f"- VIX: {_fmt_num(sentiment.get('vix'))} | VIX3M: {_fmt_num(sentiment.get('vix3m'))} (source={sentiment.get('vix_term_source')}) "
-        f"| Term structure: {sentiment.get('term_structure')}",
-        f"- Put/Call: {_fmt_num(sentiment.get('put_call_ratio'))}",
-        f"- Risk spreads: SPY-XLU {_fmt_pct(sentiment.get('spy_xlu'))} | HYG-IEF {_fmt_pct(sentiment.get('hyg_ief'))} | "
-        f"BTC-Gold {_fmt_pct(sentiment.get('btc_gold'))}",
-        "",
-        "=== TECHNICALS ===",
-        *asset_lines,
-        f"- Breadth diff (RSP-SPX): {_fmt_pct(technicals.get('breadth_diff'))}",
-        f"- Style ratio (XLK/XLP): {_fmt_num(technicals.get('style_ratio'))}",
-        "",
-        "=== LABELS ===",
-        f"- Macro: {labels.get('macro_regime')} | Liquidity: {labels.get('liquidity_regime')} | "
-        f"Sentiment: {labels.get('sentiment_regime')} | Technical: {labels.get('technical_regime')}",
+    # Fundamentals signals
+    fund = modules.get("fundamentals", {}) or {}
+    fund_keys = [
+        "dgs2",
+        "dgs10",
+        "term_spread",
+        "ffr_minus_2y",
+        "real10y",
+        "breakeven10y",
+        "ig_oas",
+        "hy_oas",
+        "dxy",
     ]
-    return "\n".join(prompt)
+    fund_signals: List[Dict[str, Any]] = []
+    fund_missing: List[str] = []
+    for k in fund_keys:
+        val = fund.get(k)
+        quality = "good" if val is not None else "missing"
+        fund_signals.append({"name": k, "value": val, "quality": quality})
+        if val is None:
+            fund_missing.append(k)
+    signals["fundamentals"] = fund_signals
+    data_quality["fundamentals"] = fund_missing
+    heuristics["fundamentals"] = labels.get("macro_regime", "Unknown")
+
+    # Liquidity signals
+    liq = modules.get("liquidity", {}) or {}
+    liq_keys = [
+        "walcl",
+        "rrp",
+        "tga",
+        "net_liquidity",
+        "net_change_4w",
+        "credit_ratio",
+        "credit_change_20d",
+    ]
+    liq_signals: List[Dict[str, Any]] = []
+    liq_missing: List[str] = []
+    for k in liq_keys:
+        val = liq.get(k)
+        quality = "good" if val is not None else "missing"
+        liq_signals.append({"name": k, "value": val, "quality": quality})
+        if val is None:
+            liq_missing.append(k)
+    signals["liquidity"] = liq_signals
+    data_quality["liquidity"] = liq_missing
+    heuristics["liquidity"] = labels.get("liquidity_regime", "Unknown")
+
+    # Sentiment signals
+    sent = modules.get("sentiment", {}) or {}
+    sent_keys = [
+        "fgi_score",
+        "vix",
+        "vix3m",
+        "term_structure",
+        "put_call_ratio",
+        "spy_xlu",
+        "hyg_ief",
+        "btc_gold",
+    ]
+    sent_signals: List[Dict[str, Any]] = []
+    sent_missing: List[str] = []
+    for k in sent_keys:
+        val = sent.get(k)
+        quality = "good" if val is not None else "missing"
+        sent_signals.append({"name": k, "value": val, "quality": quality})
+        if val is None:
+            sent_missing.append(k)
+    signals["sentiment"] = sent_signals
+    data_quality["sentiment"] = sent_missing
+    heuristics["sentiment"] = labels.get("sentiment_regime", "Unknown")
+
+    # Technical signals
+    tech = modules.get("technicals", {}) or {}
+    assets = tech.get("assets", {}) or {}
+    tech_signals: List[Dict[str, Any]] = []
+    tech_missing: List[str] = []
+    # We summarise each asset's trend_label and key distance metrics; missing if any critical piece absent
+    for asset_name, metrics in assets.items():
+        if not metrics:
+            tech_signals.append({"name": asset_name, "value": None, "quality": "missing"})
+            tech_missing.append(asset_name)
+            continue
+        # summarise as a dictionary including close, MA distances and trend
+        tech_signals.append(
+            {
+                "name": asset_name,
+                "value": {
+                    "close": metrics.get("close"),
+                    "distance_ma20_pct": metrics.get("distance_ma20_pct"),
+                    "distance_ma50_pct": metrics.get("distance_ma50_pct"),
+                    "distance_ma200_pct": metrics.get("distance_ma200_pct"),
+                    "atr_pct": metrics.get("atr_pct"),
+                    "boll_width": metrics.get("boll_width"),
+                    "trend_label": metrics.get("trend_label"),
+                },
+                "quality": "good",
+            }
+        )
+    # If breadth or style ratio missing, note it in missing list
+    if tech.get("breadth_diff") is None:
+        tech_missing.append("breadth_diff")
+    if tech.get("style_ratio") is None:
+        tech_missing.append("style_ratio")
+    signals["technicals"] = tech_signals
+    data_quality["technicals"] = tech_missing
+    heuristics["technicals"] = labels.get("technical_regime", "Unknown")
+
+    return signals, heuristics, data_quality
+
+
+def require_auth(
+    session: Optional[str] = Cookie(None),
+    authorization: Optional[str] = Header(None),
+    x_session_token: Optional[str] = Header(None, alias="X-Session-Token"),
+) -> None:
+    """Dependency to enforce authentication on protected endpoints."""
+    if not (APP_PASSWORD or "").strip():
+        return
+    token: Optional[str] = session
+    if not token and authorization:
+        parts = authorization.strip().split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1].strip()
+    if not token and x_session_token:
+        token = x_session_token.strip()
+    if not token or token not in _sessions:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return
+
+
+@app.post("/auth/login")
+async def login(
+    response: Response,
+    password: Optional[str] = Body(None, embed=True),
+    password_query: Optional[str] = Query(None, alias="password"),
+) -> Dict[str, str]:
+    """Simple password-based login.  Expects a JSON body with `password`.
+
+    On success a secure random session token is issued and set as a HTTPOnly
+    cookie.  If APP_PASSWORD is not set on the server, login will always
+    succeed without checking the password (not recommended for production).
+    """
+    pwd = (password if password is not None else password_query or "").strip()
+    expected = (APP_PASSWORD or "").strip()
+    if expected and pwd != expected:
+        raise HTTPException(status_code=401, detail="Invalid password")
+    token = secrets.token_hex(16)
+    _sessions[token] = {"created": time.time()}
+    response.set_cookie(key="session", value=token, httponly=True, secure=False, samesite="lax")
+    # 同时返回 token，方便非浏览器客户端用 Authorization 头调用受保护接口
+    return {"message": "login successful", "token": token}
+
+
+@app.post("/auth/logout")
+async def logout(
+    response: Response,
+    session: Optional[str] = Cookie(None),
+    authorization: Optional[str] = Header(None),
+    x_session_token: Optional[str] = Header(None, alias="X-Session-Token"),
+) -> Dict[str, str]:
+    """Invalidate the current session cookie and remove it from the session store."""
+    token: Optional[str] = session
+    if not token and authorization:
+        parts = authorization.strip().split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1].strip()
+    if not token and x_session_token:
+        token = x_session_token.strip()
+    if token and token in _sessions:
+        _sessions.pop(token, None)
+    response.delete_cookie("session")
+    return {"message": "logged out"}
+
+
+@app.post("/v3/snapshot/run")
+async def run_snapshot(
+    date: Optional[str] = Query(None, description="YYYY-MM-DD, default today"),
+    auth: Any = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Generate a market snapshot for the given date and cache it.
+
+    This endpoint triggers data collection for fundamentals, liquidity,
+    sentiment and technicals for the specified date.  It also computes
+    heuristic labels and lightweight signal summaries.  The resulting
+    snapshot is stored in memory and can be retrieved via `/v3/snapshot/{id}`.
+    """
+    target_date = _parse_date(date)
+    date_str = target_date.isoformat()
+    try:
+        fundamentals = fetch_fundamentals(date_str)
+        liquidity = fetch_liquidity(date_str)
+        sentiment = fetch_sentiment(date_str)
+        technicals = fetch_technicals(date_str)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.exception("Failed to build snapshot")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    modules = {
+        "fundamentals": fundamentals,
+        "liquidity": liquidity,
+        "sentiment": sentiment,
+        "technicals": technicals,
+    }
+    labels = assign_labels(modules)
+    signals, heuristics_by_module, data_quality = compute_signals(modules, labels)
+    snapshot_id = secrets.token_hex(8)
+    snapshot = {
+        "id": snapshot_id,
+        "date": date_str,
+        "modules": modules,
+        "labels": labels,
+        "signals": signals,
+        "heuristics": heuristics_by_module,
+        "data_quality": data_quality,
+    }
+    _snapshot_cache[snapshot_id] = snapshot
+    return snapshot
+
+
+@app.get("/v3/snapshot/{snapshot_id}")
+async def get_snapshot(snapshot_id: str, auth: Any = Depends(require_auth)) -> Dict[str, Any]:
+    """Return a previously generated snapshot by id."""
+    snapshot = _snapshot_cache.get(snapshot_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    return snapshot
+
+
+class ModuleAnalysisRequest(BaseModel):
+    snapshot_id: str
+    module: str
+    call_llm: Optional[bool] = True  # 是否调用 LLM，默认调用
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
+
+@app.post("/v3/analysis/module")
+async def analyse_module(req: ModuleAnalysisRequest, auth: Any = Depends(require_auth)) -> Dict[str, Any]:
+    """对单个模块进行 LLM 分析。
+
+    该端点会：
+    1. 获取指定模块的信号、标签和数据质量信息
+    2. 构建分析 prompt
+    3. 调用 Gemini API 生成分析结果（如果 call_llm=True）
+    
+    参数：
+    - snapshot_id: 快照 ID（由 /v3/snapshot/run 生成）
+    - module: 模块名称（fundamentals/liquidity/sentiment/technicals）
+    - call_llm: 是否调用 LLM（默认 True）
+    """
+    snapshot = _snapshot_cache.get(req.snapshot_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    module_name = req.module.lower()
+    if module_name not in {"fundamentals", "liquidity", "sentiment", "technicals"}:
+        raise HTTPException(status_code=400, detail="Invalid module name")
+    signals = snapshot["signals"].get(module_name, [])
+    heuristic_label = snapshot["heuristics"].get(module_name)
+    missing = snapshot["data_quality"].get(module_name, [])
+    
+    # System prompt
+    system_prompt = (
+        "你是一名买方宏观与跨资产策略分析师。你必须严格基于输入数据推断，"
+        "不得臆造未提供的事实/数值；若数据缺失需明确标注。"
+        "输出需专业、结构化、可执行。"
+    )
+    
+    # Build a user prompt for this module
+    signals_text_parts = []
+    for s in signals:
+        val = s["value"]
+        if isinstance(val, dict):
+            sub = ", ".join(
+                [
+                    f"{k}:{_fmt_num(v) if isinstance(v, (int, float)) else v}"
+                    for k, v in val.items()
+                ]
+            )
+            signals_text_parts.append(f"{s['name']}({sub})")
+        else:
+            signals_text_parts.append(f"{s['name']}={val}")
+    signals_text = "; ".join(signals_text_parts)
+    missing_text = ", ".join(missing) if missing else "无"
+    user_prompt = (
+        f"以下是 {module_name} 模块的信号和粗略标签，请根据它们给出简短的分析：\n"
+        f"- 信号: {signals_text}\n"
+        f"- 预估标签: {heuristic_label}\n"
+        f"- 缺失指标: {missing_text}\n"
+        "你需要解释这些信号之间的关系并评估预估标签是否合理，指出数据缺口可能造成的偏差，"
+        "最后给出 2-3 条该模块对风险资产影响的简要结论。"
+    )
+    
+    response: Dict[str, Any] = {
+        "module": module_name,
+        "signals": signals,
+        "heuristic_label": heuristic_label,
+        "data_quality": missing,
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+    }
+    
+    # 调用 Gemini API
+    if req.call_llm:
+        analysis_text, error = call_gemini(system_prompt, user_prompt, model=req.model)
+        if analysis_text:
+            response["analysis"] = analysis_text
+            response["llm_provider"] = "gemini"
+            response["llm_model"] = req.model or GEMINI_DEFAULT_MODEL
+        else:
+            response["analysis"] = None
+            response["llm_error"] = error
+    
+    return response
+
+
+class OverallAnalysisRequest(BaseModel):
+    snapshot_id: str
+    call_llm: Optional[bool] = True  # 是否调用 LLM，默认调用
+    include_module_summaries: Optional[bool] = True
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
+
+@app.post("/v3/analysis/overall")
+async def analyse_overall(req: OverallAnalysisRequest, auth: Any = Depends(require_auth)) -> Dict[str, Any]:
+    """对所有模块进行综合 LLM 分析。
+
+    该端点会：
+    1. 获取快照中的所有模块数据
+    2. 使用 build_llm_prompts() 构建综合分析 prompt
+    3. 调用 Gemini API 生成完整的市场分析报告（如果 call_llm=True）
+    
+    参数：
+    - snapshot_id: 快照 ID（由 /v3/snapshot/run 生成）
+    - call_llm: 是否调用 LLM（默认 True）
+    - include_module_summaries: 是否包含模块级别的信号/启发式标签/数据质量信息
+    """
+    snapshot = _snapshot_cache.get(req.snapshot_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    modules = snapshot["modules"]
+    labels = snapshot["labels"]
+    prompts = build_llm_prompts(snapshot["date"], modules, labels)
+    
+    response: Dict[str, Any] = {
+        "system_prompt": prompts["system_prompt"],
+        "user_prompt": prompts["user_prompt"],
+        "labels": labels,
+    }
+    
+    if req.include_module_summaries:
+        response["heuristics"] = snapshot["heuristics"]
+        response["data_quality"] = snapshot["data_quality"]
+        response["signals"] = snapshot["signals"]
+    
+    # 调用 Gemini API
+    if req.call_llm:
+        analysis_text, error = call_gemini(
+            prompts["system_prompt"], 
+            prompts["user_prompt"],
+            temperature=1.0,
+            max_tokens=10240,  # 总体分析需要更长的输出
+            model=req.model,
+        )
+        if analysis_text:
+            response["analysis"] = analysis_text
+            response["llm_provider"] = "gemini"
+            response["llm_model"] = req.model or GEMINI_DEFAULT_MODEL
+        else:
+            response["analysis"] = None
+            response["llm_error"] = error
+    
+    return response
+
+
+class ChatRequest(BaseModel):
+    snapshot_id: str
+    messages: List[Dict[str, str]]  # [{"role": "user"|"assistant", "content": "..."}]
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
+
+@app.post("/v3/chat")
+async def chat(req: ChatRequest, auth: Any = Depends(require_auth)) -> Dict[str, Any]:
+    """基于市场快照的多轮对话。
+
+    该端点会：
+    1. 获取快照数据构建上下文
+    2. 使用 Gemini API 进行多轮对话
+    
+    参数：
+    - snapshot_id: 快照 ID（由 /v3/snapshot/run 生成）
+    - messages: 对话历史，格式为 [{"role": "user"|"assistant", "content": "..."}]
+    
+    返回：
+    - system_prompt: 系统提示词（包含市场快照上下文）
+    - reply: LLM 回复内容
+    - llm_provider/llm_model: LLM 提供商和模型信息
+    """
+    snapshot = _snapshot_cache.get(req.snapshot_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    
+    # 构建包含市场快照的系统提示词
+    prompt_context = build_prompt_context(snapshot["modules"], snapshot["labels"])
+    system_prompt = (
+        "你是一名买方宏观与跨资产策略分析师。请参考以下市场快照并回答用户问题。\n"
+        "你必须严格基于提供的数据回答，不得臆造数据。如果数据不足以回答问题，请明确说明。\n\n"
+        + prompt_context
+    )
+    
+    response: Dict[str, Any] = {
+        "system_prompt": system_prompt,
+    }
+    
+    # 调用 Gemini Chat API
+    if req.messages:
+        reply_text, error = call_gemini_chat(
+            system_prompt,
+            req.messages,
+            temperature=1.0,
+            max_tokens=10240,
+            model=req.model,
+        )
+        if reply_text:
+            response["reply"] = reply_text
+            response["llm_provider"] = "gemini"
+            response["llm_model"] = req.model or GEMINI_DEFAULT_MODEL
+        else:
+            response["reply"] = None
+            response["llm_error"] = error
+    else:
+        response["reply"] = "请发送您的问题。"
+    
+    return response
 
 
 def build_llm_prompts(date_str: str, modules: Dict[str, Any], labels: Dict[str, str]) -> Dict[str, str]:
@@ -1077,10 +1920,10 @@ def build_llm_prompts(date_str: str, modules: Dict[str, Any], labels: Dict[str, 
 - 指出缺失项（如 put/call、calendar 403 等）以及这些缺失对结论的影响。
 - 标注你认为最不可信/最需复核的数据点，并说明原因（例如数据源、口径、滞后）。
 
-2) 模块内深度解读（逐模块，强调“内部数据关联” + 与 regime 的一致性）
+2) 模块内深度解读（逐模块，强调"内部数据关联" + 与 regime 的一致性）
 2.1 Fundamentals（利率曲线/政策预期/美元/关键宏观事件）
 - 解释 2Y、10Y、期限利差、FFR-2Y 的相互关系（政策 vs 市场定价）。
-- 结合 Real10Y 与 10Y breakeven（若有）判断“实际利率/通胀预期”对美元与黄金的含义。
+- 结合 Real10Y 与 10Y breakeven（若有）判断"实际利率/通胀预期"对美元与黄金的含义。
 - 用 3-5 条要点给出该模块结论，并用一句话判断其对 risk assets 的方向性影响。
 
 2.2 Liquidity（WALCL/RRP/TGA/Net Liquidity、信用条件）
@@ -1089,16 +1932,16 @@ def build_llm_prompts(date_str: str, modules: Dict[str, Any], labels: Dict[str, 
 
 2.3 Sentiment（FGI/VIX term structure/put-call/风险价差）
 - 检查 FGI、VIX 与 VIX3M 的组合是否一致（例如 contango/ backwardation）。
-- 将 put/call（若有）与其它风险指标交叉验证，指出是否出现“情绪与价格背离”。
+- 将 put/call（若有）与其它风险指标交叉验证，指出是否出现"情绪与价格背离"。
 
 2.4 Technicals（趋势/波动/宽度/广度/风格）
-- 基于 MA 距离、ATR%、boll width、trend label 判断“趋势强度 vs 震荡”。
+- 基于 MA 距离、ATR%、boll width、trend label 判断"趋势强度 vs 震荡"。
 - 用 breadth（RSP-SPX）与风格比（XLK/XLP）解释市场内部结构（集中度/轮动）。
 
 3) 跨模块综合（相关性/驱动/一致性评分）
-- 用一段话总结：利率/美元/黄金、流动性、情绪、技术面是否“同向确认”还是“相互打架”。
+- 用一段话总结：利率/美元/黄金、流动性、情绪、技术面是否"同向确认"还是"相互打架"。
 - 列出 3 条最关键的跨资产链条（例如：Real yields → USD → Gold；Net Liquidity → Equities/Crypto；Curve → Small caps）。
-- 给出一个“regime 一致性评分”（0-100，主观即可），并解释评分依据。
+- 给出一个"regime 一致性评分"（0-100，主观即可），并解释评分依据。
 
 4) 整体趋势判断与场景（专业策略框架）
 - Base case（1-2 周）：给出趋势判断（risk-on/risk-off/震荡）与 2-3 个可观察触发条件。
@@ -1106,7 +1949,7 @@ def build_llm_prompts(date_str: str, modules: Dict[str, Any], labels: Dict[str, 
 - Bull/Bear 备选场景：各写 2-3 条触发条件 + 1 条应对（仓位/对冲/择时原则）。
 
 5) 交易与风控要点（不要求具体标的，但要可执行）
-- 列出 3 条“该做/不该做”的原则（例如追涨/逢低/对冲/杠杆）。
+- 列出 3 条"该做/不该做"的原则（例如追涨/逢低/对冲/杠杆）。
 - 列出 3 个你会重点盯的 next-step 数据或新闻（优先来自 Key events / Top news）。
 
 输出要求：
@@ -1115,6 +1958,69 @@ def build_llm_prompts(date_str: str, modules: Dict[str, Any], labels: Dict[str, 
 """.strip()
 
     return {"system_prompt": system_prompt, "user_prompt": user_prompt}
+
+
+def build_prompt_context(modules: Dict[str, Any], labels: Dict[str, str]) -> str:
+    """根据四大模块构建面向 LLM 的提示文本。"""
+    fundamentals = modules["fundamentals"]
+    liquidity = modules["liquidity"]
+    sentiment = modules["sentiment"]
+    technicals = modules["technicals"]
+
+    news_lines = [f"- {n['title']} (source: {n.get('source')})" for n in fundamentals.get("news", [])]
+    event_lines = [
+        f"- {e.get('category')}: {e.get('actual')} (fcst {e.get('forecast')}, prev {e.get('previous')})"
+        for e in fundamentals.get("events", [])
+    ]
+    assets = technicals.get("assets", {})
+    asset_lines = []
+    for name, data in assets.items():
+        if not data:
+            continue
+        close_val = data.get("close")
+        atr_text = _fmt_pct(data.get("atr_pct"), signed=False)
+        asset_lines.append(
+            f"- {name}: {_fmt_num(close_val, 2)} "
+            f"(MA20 {_fmt_pct(data.get('distance_ma20_pct'))} / "
+            f"MA50 {_fmt_pct(data.get('distance_ma50_pct'))} / "
+            f"MA200 {_fmt_pct(data.get('distance_ma200_pct'))}, "
+            f"ATR% {atr_text}, "
+            f"trend {data.get('trend_label')})"
+        )
+
+    prompt = [
+        "=== FUNDAMENTALS ===",
+        f"- 2Y: {_fmt_num(fundamentals.get('dgs2'), 2, '%')} | 10Y: {_fmt_num(fundamentals.get('dgs10'), 2, '%')} "
+        f"| Term spread: {_fmt_num(fundamentals.get('term_spread'), 2, '%')}",
+        f"- Fed Funds: {_fmt_num(fundamentals.get('fedfunds'), 2, '%')} | FFR-2Y: {_fmt_num(fundamentals.get('ffr_minus_2y'), 2, '%')}",
+        f"- DXY: {_fmt_num(fundamentals.get('dxy'))} (ticker {fundamentals.get('dxy_ticker') or 'DX-Y.NYB/DXY'})",
+        f"- Key events:\n{chr(10).join(event_lines) if event_lines else '  (none, maybe credentials missing)'}",
+        f"- Top news:\n{chr(10).join(news_lines) if news_lines else '  (none)'}",
+        "",
+        "=== LIQUIDITY ===",
+        f"- Net liquidity: {_fmt_num(liquidity.get('net_liquidity'), 2, 'B')} (Δ4w {_fmt_num(liquidity.get('net_change_4w'), 2, 'B')})",
+        f"- Components: WALCL {_fmt_num(liquidity.get('walcl'), 2, 'B')} | RRP {_fmt_num(liquidity.get('rrp'), 2, 'B')} | "
+        f"TGA {_fmt_num(liquidity.get('tga'), 2, 'B')}",
+        f"- Credit ratio (HYG/IEI): {_fmt_num(liquidity.get('credit_ratio'))} (Δ20d {_fmt_num(liquidity.get('credit_change_20d'))})",
+        "",
+        "=== SENTIMENT ===",
+        f"- Fear & Greed: {sentiment.get('fgi_score')} ({sentiment.get('fgi_rating')}, source={sentiment.get('fgi_source')})",
+        f"- VIX: {_fmt_num(sentiment.get('vix'))} | VIX3M: {_fmt_num(sentiment.get('vix3m'))} (source={sentiment.get('vix_term_source')}) "
+        f"| Term structure: {sentiment.get('term_structure')}",
+        f"- Put/Call: {_fmt_num(sentiment.get('put_call_ratio'))}",
+        f"- Risk spreads: SPY-XLU {_fmt_pct(sentiment.get('spy_xlu'))} | HYG-IEF {_fmt_pct(sentiment.get('hyg_ief'))} | "
+        f"BTC-Gold {_fmt_pct(sentiment.get('btc_gold'))}",
+        "",
+        "=== TECHNICALS ===",
+        *asset_lines,
+        f"- Breadth diff (RSP-SPX): {_fmt_pct(technicals.get('breadth_diff'))}",
+        f"- Style ratio (XLK/XLP): {_fmt_num(technicals.get('style_ratio'))}",
+        "",
+        "=== LABELS ===",
+        f"- Macro: {labels.get('macro_regime')} | Liquidity: {labels.get('liquidity_regime')} | "
+        f"Sentiment: {labels.get('sentiment_regime')} | Technical: {labels.get('technical_regime')}",
+    ]
+    return "\n".join(prompt)
 
 
 @app.get("/health")
@@ -1148,45 +2054,8 @@ async def get_context(date: Optional[str] = Query(None, description="YYYY-MM-DD,
     return {**modules, "date": date_str, "labels": labels, "prompt_context": prompt_context}
 
 
-@app.get("/v2/prompt")
-async def get_prompt(
-    date: Optional[str] = Query(None, description="YYYY-MM-DD, default today"),
-    include_context: bool = Query(True, description="是否返回完整 context（modules）"),
-) -> Dict[str, Any]:
-    """返回可直接用于 LLM 的 system/user prompts（并可选携带 context）。
-
-    设计目的：让 Dify 仅通过 HTTP 调用即可拿到“数据 + 固定分析框架提示词”。
-    """
-    target_date = _parse_date(date)
-    date_str = target_date.isoformat()
-
-    try:
-        fundamentals = fetch_fundamentals(date_str)
-        liquidity = fetch_liquidity(date_str)
-        sentiment = fetch_sentiment(date_str)
-        technicals = fetch_technicals(date_str)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logging.exception("Failed to build prompt")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    modules = {
-        "fundamentals": fundamentals,
-        "liquidity": liquidity,
-        "sentiment": sentiment,
-        "technicals": technicals,
-    }
-    labels = assign_labels(modules)
-    prompts = build_llm_prompts(date_str, modules, labels)
-    resp: Dict[str, Any] = {"date": date_str, "labels": labels, **prompts}
-    if include_context:
-        resp["context"] = modules
-        resp["prompt_context"] = build_prompt_context(modules, labels)
-    return resp
-
-
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
