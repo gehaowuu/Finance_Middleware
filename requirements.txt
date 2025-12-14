@@ -10,3 +10,6 @@ feedparser
 python-dotenv
 tradingeconomics
 fear-greed-index
+beautifulsoup4
+lxml
+google-genai
