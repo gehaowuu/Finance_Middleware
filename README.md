@@ -69,7 +69,7 @@ python main.py
 
 **方式2：使用uvicorn（推荐开发）**
 ```bash
-uvicorn main_v3:app --reload --host 0.0.0.0 --port 8000
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 访问API文档：http://127.0.0.1:8000/docs
