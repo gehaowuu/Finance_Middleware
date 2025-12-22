@@ -4,7 +4,9 @@ import time
 import json
 import io
 import ssl
+import math
 import datetime as dt
+from bisect import bisect_left
 from datetime import datetime, timedelta, date, timezone
 from io import StringIO
 from typing import Any, Dict, List, Optional, Tuple
@@ -106,6 +108,7 @@ _sessions: Dict[str, Dict[str, Any]] = {}
 # IMPORTANT: The source-of-truth is the filesystem (DATA_DIR). This in-memory
 # dict is only a performance cache for hot snapshots.
 _snapshot_cache: Dict[str, Dict[str, Any]] = {}
+_validation_cache: Dict[str, Dict[str, Any]] = {}
 
 #
 # Persistent storage (Render Persistent Disk)
@@ -116,11 +119,13 @@ _snapshot_cache: Dict[str, Dict[str, Any]] = {}
 DATA_DIR = os.path.abspath(os.getenv("DATA_DIR") or os.path.join(_BASE_DIR, "data"))
 SNAPSHOT_STORE_DIR = os.path.join(DATA_DIR, "snapshots")
 LLM_LOG_DIR = os.path.join(DATA_DIR, "llm_logs")
+VALIDATION_STORE_DIR = os.path.join(DATA_DIR, "validations")
 
 PERSIST_ENABLED = True
 try:
     os.makedirs(SNAPSHOT_STORE_DIR, exist_ok=True)
     os.makedirs(LLM_LOG_DIR, exist_ok=True)
+    os.makedirs(VALIDATION_STORE_DIR, exist_ok=True)
 except Exception as exc:
     # 若磁盘不可写，降级到内存（仍可跑通，但重启会丢数据）
     logging.warning("DATA_DIR 不可写，持久化被禁用: %s", exc)
@@ -137,6 +142,10 @@ def _atomic_write_json(path: str, obj: Any) -> None:
 
 def _snapshot_path(snapshot_id: str) -> str:
     return os.path.join(SNAPSHOT_STORE_DIR, f"{snapshot_id}.json")
+
+
+def _validation_path(validation_id: str) -> str:
+    return os.path.join(VALIDATION_STORE_DIR, f"{validation_id}.json")
 
 
 def _save_snapshot_to_disk(snapshot: Dict[str, Any]) -> None:
@@ -176,6 +185,540 @@ def _get_snapshot(snapshot_id: str) -> Optional[Dict[str, Any]]:
     if snap:
         _snapshot_cache[snapshot_id] = snap
     return snap
+
+
+def _save_validation_to_disk(validation_obj: Dict[str, Any]) -> None:
+    if not PERSIST_ENABLED:
+        return
+    vid = str(validation_obj.get("validation_id") or "").strip()
+    if not vid:
+        return
+    try:
+        payload = {**validation_obj, "persisted_ts": time.time()}
+        _atomic_write_json(_validation_path(vid), payload)
+        _validation_cache[vid] = payload
+    except Exception as exc:
+        logging.warning("validation 落盘失败（vid=%s）: %s", vid, exc)
+
+
+def _load_validation_from_disk(validation_id: str) -> Optional[Dict[str, Any]]:
+    if not PERSIST_ENABLED:
+        return None
+    path = _validation_path(validation_id)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logging.warning("validation 读取失败（vid=%s）: %s", validation_id, exc)
+        return None
+
+
+def _get_validation(validation_id: str) -> Optional[Dict[str, Any]]:
+    """Get validation by id (memory cache first, then disk)."""
+    val = _validation_cache.get(validation_id)
+    if val:
+        return val
+    val = _load_validation_from_disk(validation_id)
+    if val:
+        _validation_cache[validation_id] = val
+    return val
+
+
+# -----------------------------------------------------------------------------
+# Validation (Indicator efficacy for Regime labels)
+# -----------------------------------------------------------------------------
+
+def _safe_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        try:
+            xf = float(x)
+            if math.isfinite(xf):
+                return xf
+            return None
+        except Exception:
+            return None
+    try:
+        s = str(x).strip()
+        if not s:
+            return None
+        # strip percent
+        if s.endswith("%"):
+            s = s[:-1].strip()
+        xf = float(s)
+        return xf if math.isfinite(xf) else None
+    except Exception:
+        return None
+
+
+def _entropy_from_counts(counts: Dict[str, int]) -> float:
+    total = sum(max(0, int(v)) for v in (counts or {}).values())
+    if total <= 0:
+        return 0.0
+    h = 0.0
+    for v in counts.values():
+        c = max(0, int(v))
+        if c <= 0:
+            continue
+        p = c / total
+        h -= p * math.log(p)
+    return h
+
+
+def _quantile_cutpoints(values: List[float], q: int) -> List[float]:
+    """Return sorted cutpoints (length <= q-1)."""
+    q = int(q or 0)
+    if q < 2:
+        q = 2
+    vals = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    vals.sort()
+    n = len(vals)
+    if n < 3:
+        return []
+    cutpoints: List[float] = []
+    last = None
+    for k in range(1, q):
+        pos = (n - 1) * (k / q)
+        idx = int(round(pos))
+        idx = min(max(idx, 0), n - 1)
+        cp = vals[idx]
+        if last is None or cp > last:
+            cutpoints.append(cp)
+            last = cp
+    return cutpoints
+
+
+def _bin_index(value: float, cutpoints: List[float]) -> int:
+    """Return bin id in [0, len(cutpoints)] (left-closed bins)."""
+    try:
+        return bisect_left(cutpoints, float(value))
+    except Exception:
+        return 0
+
+
+def _contingency_table(bin_ids: List[int], labels: List[str], label_order: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Build contingency table counts for (bin -> label)."""
+    if len(bin_ids) != len(labels):
+        raise ValueError("bin_ids and labels length mismatch")
+    # label order: keep deterministic display
+    unique = []
+    seen = set()
+    for y in (label_order or []):
+        if y not in seen:
+            unique.append(y)
+            seen.add(y)
+    for y in labels:
+        if y not in seen:
+            unique.append(y)
+            seen.add(y)
+    label_names = unique
+
+    n_bins = (max(bin_ids) + 1) if bin_ids else 0
+    table = [[0 for _ in label_names] for _ in range(n_bins)]
+    for b, y in zip(bin_ids, labels):
+        if b < 0 or b >= n_bins:
+            continue
+        try:
+            j = label_names.index(y)
+        except ValueError:
+            continue
+        table[b][j] += 1
+    return {"label_names": label_names, "table": table}
+
+
+def _mutual_information(table: List[List[int]]) -> float:
+    """Mutual information I(X;Y) in nats for contingency table."""
+    if not table:
+        return 0.0
+    n = sum(sum(row) for row in table)
+    if n <= 0:
+        return 0.0
+    row_sums = [sum(row) for row in table]
+    col_sums = [sum(table[i][j] for i in range(len(table))) for j in range(len(table[0]))]
+    mi = 0.0
+    for i in range(len(table)):
+        for j in range(len(table[0])):
+            o = table[i][j]
+            if o <= 0:
+                continue
+            pxy = o / n
+            px = row_sums[i] / n if row_sums[i] else 0.0
+            py = col_sums[j] / n if col_sums[j] else 0.0
+            if px > 0 and py > 0:
+                mi += pxy * math.log(pxy / (px * py))
+    return mi
+
+
+def _cramers_v(table: List[List[int]]) -> float:
+    if not table:
+        return 0.0
+    n = sum(sum(row) for row in table)
+    if n <= 0:
+        return 0.0
+    r = len(table)
+    k = len(table[0]) if table[0] else 0
+    if r < 2 or k < 2:
+        return 0.0
+    row_sums = [sum(row) for row in table]
+    col_sums = [sum(table[i][j] for i in range(r)) for j in range(k)]
+    chi2 = 0.0
+    for i in range(r):
+        for j in range(k):
+            e = (row_sums[i] * col_sums[j]) / n if n else 0.0
+            if e <= 0:
+                continue
+            o = table[i][j]
+            chi2 += (o - e) * (o - e) / e
+    denom = n * (min(r - 1, k - 1))
+    if denom <= 0:
+        return 0.0
+    return math.sqrt(max(0.0, chi2 / denom))
+
+
+def _majority_accuracy(labels: List[str]) -> float:
+    if not labels:
+        return 0.0
+    counts: Dict[str, int] = {}
+    for y in labels:
+        counts[y] = counts.get(y, 0) + 1
+    return max(counts.values()) / len(labels) if counts else 0.0
+
+
+def _binned_majority_accuracy(bin_ids: List[int], labels: List[str]) -> float:
+    if not labels:
+        return 0.0
+    by_bin: Dict[int, Dict[str, int]] = {}
+    for b, y in zip(bin_ids, labels):
+        d = by_bin.setdefault(int(b), {})
+        d[y] = d.get(y, 0) + 1
+    correct = 0
+    for d in by_bin.values():
+        correct += max(d.values()) if d else 0
+    return correct / len(labels)
+
+
+def _indicator_id(module: str, key: str) -> str:
+    return f"{module}.{key}"
+
+
+_DEFAULT_VALIDATION_INDICATORS: List[Dict[str, Any]] = [
+    # Fundamentals (macro) - 1-3 months horizon (calendar days)
+    {"id": _indicator_id("fundamentals", "term_spread"), "module": "fundamentals", "key": "term_spread", "target_label": "macro_regime", "horizons_days": [30, 90]},
+    {"id": _indicator_id("fundamentals", "ffr_minus_2y"), "module": "fundamentals", "key": "ffr_minus_2y", "target_label": "macro_regime", "horizons_days": [30, 90]},
+    {"id": _indicator_id("fundamentals", "dxy"), "module": "fundamentals", "key": "dxy", "target_label": "macro_regime", "horizons_days": [30, 90]},
+    # Liquidity - 1-5 days
+    {"id": _indicator_id("liquidity", "net_liquidity"), "module": "liquidity", "key": "net_liquidity", "target_label": "liquidity_regime", "horizons_days": [1, 3, 5]},
+    {"id": _indicator_id("liquidity", "net_change_4w"), "module": "liquidity", "key": "net_change_4w", "target_label": "liquidity_regime", "horizons_days": [1, 3, 5]},
+    # Sentiment - 1-5 days
+    {"id": _indicator_id("sentiment", "fgi_score"), "module": "sentiment", "key": "fgi_score", "target_label": "sentiment_regime", "horizons_days": [1, 3, 5]},
+    {"id": _indicator_id("sentiment", "vix"), "module": "sentiment", "key": "vix", "target_label": "sentiment_regime", "horizons_days": [1, 3, 5]},
+    {"id": _indicator_id("sentiment", "put_call_ratio"), "module": "sentiment", "key": "put_call_ratio", "target_label": "sentiment_regime", "horizons_days": [1, 3, 5]},
+    # Technicals - 1-5 days
+    {"id": _indicator_id("technicals", "breadth_diff"), "module": "technicals", "key": "breadth_diff", "target_label": "technical_regime", "horizons_days": [1, 3, 5]},
+    {"id": _indicator_id("technicals", "style_ratio"), "module": "technicals", "key": "style_ratio", "target_label": "technical_regime", "horizons_days": [1, 3, 5]},
+]
+
+
+_LABEL_ORDERS: Dict[str, List[str]] = {
+    "macro_regime": ["Hawkish", "Neutral", "Dovish"],
+    "liquidity_regime": ["Tightening", "Neutral", "Easing"],
+    "sentiment_regime": ["Fear", "Neutral", "Greed"],
+    "technical_regime": ["Downtrend", "Range", "Trending", "Uptrend"],  # allow future expansion
+}
+
+
+def _load_snapshots_by_date_upto(as_of_date: date) -> List[Dict[str, Any]]:
+    """Load snapshots (one per date, keep latest created_ts) with snapshot.date <= as_of_date."""
+    if not os.path.isdir(SNAPSHOT_STORE_DIR):
+        return []
+    by_date: Dict[date, Dict[str, Any]] = {}
+    for fname in os.listdir(SNAPSHOT_STORE_DIR):
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(SNAPSHOT_STORE_DIR, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                snap = json.load(f)
+            if not isinstance(snap, dict):
+                continue
+            dstr = str(snap.get("date") or "").strip()
+            if not dstr:
+                continue
+            d = datetime.strptime(dstr, "%Y-%m-%d").date()
+            if d > as_of_date:
+                continue
+            prev = by_date.get(d)
+            if not prev or float(snap.get("created_ts") or 0) >= float(prev.get("created_ts") or 0):
+                by_date[d] = snap
+        except Exception:
+            continue
+    return [by_date[d] for d in sorted(by_date.keys())]
+
+
+def _extract_indicator_value(snapshot: Dict[str, Any], module: str, key: str) -> Optional[float]:
+    modules = snapshot.get("modules") or {}
+    mod = modules.get(module) or {}
+    return _safe_float(mod.get(key))
+
+
+def _extract_label(snapshot: Dict[str, Any], label_key: str) -> Optional[str]:
+    labels = snapshot.get("labels") or {}
+    val = labels.get(label_key)
+    if not val:
+        return None
+    v = str(val).strip()
+    if not v or v.lower() == "unknown":
+        return None
+    return v
+
+
+def _evaluate_indicator(
+    snapshots: List[Dict[str, Any]],
+    module: str,
+    key: str,
+    target_label_key: str,
+    horizon_days: int,
+    quantiles: int,
+    as_of_date: date,
+) -> Dict[str, Any]:
+    """Evaluate one indicator's binned predictiveness for future label."""
+    # Build date index
+    date_list: List[date] = []
+    for s in snapshots:
+        dstr = str(s.get("date") or "").strip()
+        if not dstr:
+            continue
+        try:
+            date_list.append(datetime.strptime(dstr, "%Y-%m-%d").date())
+        except Exception:
+            continue
+    # snapshots should already align with date_list ordering (same length)
+    # But keep safe: rebuild aligned list
+    aligned: List[Tuple[date, Dict[str, Any]]] = []
+    for s in snapshots:
+        dstr = str(s.get("date") or "").strip()
+        if not dstr:
+            continue
+        try:
+            d = datetime.strptime(dstr, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        aligned.append((d, s))
+    aligned.sort(key=lambda x: x[0])
+    dates = [d for d, _ in aligned]
+
+    xs: List[float] = []
+    ys: List[str] = []
+    feature_dates: List[str] = []
+    future_dates: List[str] = []
+
+    for i, (d, s) in enumerate(aligned):
+        if d > as_of_date:
+            continue
+        x = _extract_indicator_value(s, module, key)
+        if x is None:
+            continue
+        target_date = d + timedelta(days=int(horizon_days))
+        j = bisect_left(dates, target_date, lo=i + 1)
+        if j >= len(aligned):
+            continue
+        y = _extract_label(aligned[j][1], target_label_key)
+        if not y:
+            continue
+        xs.append(float(x))
+        ys.append(y)
+        feature_dates.append(d.isoformat())
+        future_dates.append(aligned[j][0].isoformat())
+
+    n = len(xs)
+    min_n = 8
+    if n < min_n:
+        return {
+            "n": n,
+            "status": "insufficient_data",
+            "reason": f"样本量不足（<{min_n}）",
+        }
+
+    cutpoints = _quantile_cutpoints(xs, int(quantiles or 5))
+    if len(cutpoints) < 1:
+        return {
+            "n": n,
+            "status": "insufficient_data",
+            "reason": "无法分位分桶（指标取值过于集中或样本不足）",
+        }
+
+    bin_ids = [_bin_index(v, cutpoints) for v in xs]
+    base_acc = _majority_accuracy(ys)
+    bin_acc = _binned_majority_accuracy(bin_ids, ys)
+    acc_lift = bin_acc - base_acc
+
+    # contingency + MI
+    order = _LABEL_ORDERS.get(target_label_key)
+    cont = _contingency_table(bin_ids, ys, label_order=order)
+    table = cont["table"]
+    label_names = cont["label_names"]
+    mi = _mutual_information(table)
+    label_counts = {y: ys.count(y) for y in label_names}
+    h_label = _entropy_from_counts(label_counts)
+    norm_mi = (mi / h_label) if h_label > 1e-12 else 0.0
+    v = _cramers_v(table)
+
+    # bin stats
+    bin_stats: List[Dict[str, Any]] = []
+    n_bins = len(cutpoints) + 1
+    for b in range(n_bins):
+        idxs = [k for k, bid in enumerate(bin_ids) if bid == b]
+        if not idxs:
+            continue
+        counts: Dict[str, int] = {}
+        for k in idxs:
+            y = ys[k]
+            counts[y] = counts.get(y, 0) + 1
+        maj_label = max(counts.items(), key=lambda kv: kv[1])[0] if counts else None
+        purity = (counts.get(maj_label, 0) / len(idxs)) if maj_label else 0.0
+        lo = None if b == 0 else cutpoints[b - 1]
+        hi = cutpoints[b] if b < len(cutpoints) else None
+        bin_stats.append(
+            {
+                "bin": b,
+                "range": {"gte": lo, "lt": hi},
+                "n": len(idxs),
+                "majority_label": maj_label,
+                "purity": purity,
+                "label_counts": counts,
+            }
+        )
+
+    # today bucket prediction
+    today_x = None
+    today_bin = None
+    today_pred = None
+    today_pred_prob = None
+    try:
+        # find snapshot for as_of_date
+        as_of_snap = None
+        for d, s in reversed(aligned):
+            if d == as_of_date:
+                as_of_snap = s
+                break
+        if as_of_snap:
+            today_x = _extract_indicator_value(as_of_snap, module, key)
+            if today_x is not None:
+                today_bin = _bin_index(float(today_x), cutpoints)
+                # majority label in that bin
+                for bs in bin_stats:
+                    if bs.get("bin") == today_bin:
+                        today_pred = bs.get("majority_label")
+                        lc = bs.get("label_counts") or {}
+                        denom = sum(lc.values()) or 0
+                        today_pred_prob = (lc.get(today_pred, 0) / denom) if denom else None
+                        break
+    except Exception:
+        pass
+
+    # status heuristics (prefer recent sample in future, but MVP uses overall)
+    status = "weak"
+    if norm_mi >= 0.10 and acc_lift >= 0.05:
+        status = "strong"
+    elif norm_mi >= 0.05 and acc_lift >= 0.03:
+        status = "moderate"
+    # small sample guardrail: do not overclaim
+    low_sample = n < 30
+    if low_sample and status == "strong":
+        status = "moderate"
+
+    return {
+        "n": n,
+        "horizon_days": int(horizon_days),
+        "quantiles": int(quantiles or 5),
+        "cutpoints": cutpoints,
+        "label_order": label_names,
+        "baseline_accuracy": base_acc,
+        "binned_accuracy": bin_acc,
+        "accuracy_lift": acc_lift,
+        "mutual_information": mi,
+        "label_entropy": h_label,
+        "normalized_mi": norm_mi,
+        "cramers_v": v,
+        "bin_stats": bin_stats,
+        "as_of": {
+            "date": as_of_date.isoformat(),
+            "value": today_x,
+            "bin": today_bin,
+            "pred_label": today_pred,
+            "pred_prob": today_pred_prob,
+        },
+        "status": status,
+        "low_sample": low_sample,
+    }
+
+
+def _build_validation_llm_summary(validation_obj: Dict[str, Any]) -> str:
+    """Build a compact markdown summary for LLM supplemental input."""
+    vid = str(validation_obj.get("validation_id") or "")
+    as_of_date = str(validation_obj.get("as_of_date") or "")
+    created_ts = validation_obj.get("created_ts")
+    header = (
+        "【指标有效性验证（Regime 预测）】\n"
+        f"- 来源URL: internal://finance-middleware/v3/validation/{vid}\n"
+        f"- 数据日期: {as_of_date}\n"
+        f"- 生成时间: {datetime.utcfromtimestamp(created_ts).isoformat()}Z\n"
+    )
+    lines: List[str] = [header, "\n【结论（仅基于你已落盘的历史 snapshots）】"]
+    by_module = validation_obj.get("results_by_module") or {}
+    for module_name, payload in by_module.items():
+        target = payload.get("target_label")
+        lines.append(f"\n### {module_name} → {target}")
+        items = payload.get("indicators") or []
+        # show strongest first
+        def best_score(ind: Dict[str, Any]) -> float:
+            hs = ind.get("horizons") or {}
+            best = 0.0
+            for hres in hs.values():
+                if not isinstance(hres, dict):
+                    continue
+                s = float(hres.get("normalized_mi") or 0) + float(hres.get("accuracy_lift") or 0)
+                if s > best:
+                    best = s
+            return best
+
+        items_sorted = sorted(items, key=best_score, reverse=True)
+        for ind in items_sorted:
+            ind_id = ind.get("id")
+            key = ind.get("key")
+            hs = ind.get("horizons") or {}
+            # pick best horizon
+            best_h = None
+            best_res = None
+            best = -1e9
+            for h, hres in hs.items():
+                if not isinstance(hres, dict):
+                    continue
+                score = float(hres.get("normalized_mi") or 0) + float(hres.get("accuracy_lift") or 0)
+                if score > best:
+                    best = score
+                    best_h = h
+                    best_res = hres
+            if not best_res:
+                continue
+            status = best_res.get("status") or "n/a"
+            n = best_res.get("n")
+            nmi = best_res.get("normalized_mi")
+            lift = best_res.get("accuracy_lift")
+            as_of = best_res.get("as_of") or {}
+            pred = as_of.get("pred_label")
+            prob = as_of.get("pred_prob")
+            lines.append(
+                f"- {ind_id}（{key}）：best_h={best_h}d，status={status}，n={n}，norm_mi={_fmt_num(_safe_float(nmi), 4)}，lift={_fmt_num(_safe_float(lift), 4)}；"
+                f"当前桶预测={pred}（p≈{_fmt_num(_safe_float(prob), 2)}）"
+            )
+    return "\n".join(lines).strip()
 
 
 def _append_jsonl(path: str, record: Dict[str, Any]) -> None:
@@ -2719,6 +3262,271 @@ async def get_snapshot(snapshot_id: str, auth: Any = Depends(require_auth)) -> D
     return snapshot
 
 
+@app.get("/v3/snapshots")
+async def list_snapshots(auth: Any = Depends(require_auth)) -> Dict[str, Any]:
+    """List all persisted snapshots with metadata (id, date, created_ts).
+    
+    Returns snapshots sorted by date descending (most recent first).
+    """
+    if not os.path.isdir(SNAPSHOT_STORE_DIR):
+        return {"snapshots": [], "count": 0}
+    
+    snapshots_meta: List[Dict[str, Any]] = []
+    by_date: Dict[str, Dict[str, Any]] = {}  # date -> latest snapshot meta
+    
+    for fname in os.listdir(SNAPSHOT_STORE_DIR):
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(SNAPSHOT_STORE_DIR, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                snap = json.load(f)
+            if not isinstance(snap, dict):
+                continue
+            snap_id = snap.get("id") or fname.replace(".json", "")
+            dstr = str(snap.get("date") or "").strip()
+            created_ts = float(snap.get("created_ts") or 0)
+            
+            meta = {
+                "id": snap_id,
+                "date": dstr,
+                "created_ts": created_ts,
+                "labels": snap.get("labels") or {},
+                "has_overall_report": bool(snap.get("last_overall_report")),
+            }
+            
+            # Keep only latest per date
+            if dstr:
+                prev = by_date.get(dstr)
+                if not prev or created_ts >= prev.get("created_ts", 0):
+                    by_date[dstr] = meta
+            else:
+                snapshots_meta.append(meta)
+        except Exception:
+            continue
+    
+    # Combine and sort by date descending
+    all_snapshots = list(by_date.values()) + snapshots_meta
+    all_snapshots.sort(key=lambda x: x.get("date") or "", reverse=True)
+    
+    return {
+        "snapshots": all_snapshots,
+        "count": len(all_snapshots),
+    }
+
+
+@app.get("/v3/snapshot/by-date")
+async def get_snapshot_by_date(
+    date: str = Query(..., description="YYYY-MM-DD"),
+    auth: Any = Depends(require_auth)
+) -> Dict[str, Any]:
+    """Get snapshot by date if it exists on disk.
+    
+    Returns the latest snapshot for the given date, or 404 if not found.
+    """
+    if not os.path.isdir(SNAPSHOT_STORE_DIR):
+        raise HTTPException(status_code=404, detail="No snapshots found for this date")
+    
+    target_date = date.strip()
+    best_snapshot: Optional[Dict[str, Any]] = None
+    best_ts: float = 0
+    
+    for fname in os.listdir(SNAPSHOT_STORE_DIR):
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(SNAPSHOT_STORE_DIR, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                snap = json.load(f)
+            if not isinstance(snap, dict):
+                continue
+            dstr = str(snap.get("date") or "").strip()
+            if dstr == target_date:
+                created_ts = float(snap.get("created_ts") or 0)
+                if created_ts >= best_ts:
+                    best_ts = created_ts
+                    best_snapshot = snap
+        except Exception:
+            continue
+    
+    if not best_snapshot:
+        raise HTTPException(status_code=404, detail=f"No snapshot found for date {target_date}")
+    
+    # Cache it
+    snap_id = best_snapshot.get("id")
+    if snap_id:
+        _snapshot_cache[snap_id] = best_snapshot
+    
+    return best_snapshot
+
+
+class ValidationRunRequest(BaseModel):
+    snapshot_id: str
+    indicator_ids: Optional[List[str]] = None  # 默认10个关键指标；传入则做子集
+    quantiles: Optional[int] = 5  # 分位分桶数（默认5分位）
+
+
+@app.post("/v3/validation/run")
+async def run_validation(req: ValidationRunRequest, auth: Any = Depends(require_auth)) -> Dict[str, Any]:
+    """
+    Regime 标签预测的指标有效性验证（MVP）：
+    - 仅使用你已落盘的历史 snapshots（DATA_DIR/snapshots）
+    - 对每个指标做“分位分桶 → 桶内多数预测 → lift/互信息/Cramér's V”
+    - 宏观指标默认验证 30/90 天；其余默认 1/3/5 天
+    """
+    snapshot = _get_snapshot(req.snapshot_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    as_of_date_str = str(snapshot.get("date") or "").strip()
+    if not as_of_date_str:
+        raise HTTPException(status_code=400, detail="Snapshot missing date")
+    try:
+        as_of_dt = datetime.strptime(as_of_date_str, "%Y-%m-%d").date()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid snapshot date") from exc
+
+    quantiles = int(req.quantiles or 5)
+    if quantiles < 2 or quantiles > 20:
+        raise HTTPException(status_code=400, detail="quantiles must be between 2 and 20")
+
+    # select indicator set
+    selected = _DEFAULT_VALIDATION_INDICATORS
+    if req.indicator_ids:
+        wanted = set([str(x).strip() for x in req.indicator_ids if str(x).strip()])
+        selected = [x for x in _DEFAULT_VALIDATION_INDICATORS if x.get("id") in wanted]
+        if not selected:
+            raise HTTPException(status_code=400, detail="No valid indicator_ids provided")
+
+    snapshots = _load_snapshots_by_date_upto(as_of_dt)
+    if len(snapshots) < 5:
+        raise HTTPException(
+            status_code=400,
+            detail="Not enough historical snapshots on disk (<5). Please run /v3/snapshot/run for more dates.",
+        )
+    warnings: List[str] = []
+    if len(snapshots) < 30:
+        warnings.append(f"历史 snapshots 数量偏少（{len(snapshots)}<30），统计显著性与稳健性会很弱；建议先批量生成更多日期。")
+
+    results_by_module: Dict[str, Any] = {}
+    for ind in selected:
+        module = ind["module"]
+        key = ind["key"]
+        target = ind["target_label"]
+        horizons = ind.get("horizons_days") or []
+        horizon_results: Dict[str, Any] = {}
+        for h in horizons:
+            res = _evaluate_indicator(
+                snapshots=snapshots,
+                module=module,
+                key=key,
+                target_label_key=target,
+                horizon_days=int(h),
+                quantiles=quantiles,
+                as_of_date=as_of_dt,
+            )
+            horizon_results[str(int(h))] = res
+        bucket = results_by_module.setdefault(module, {"target_label": target, "indicators": []})
+        bucket["indicators"].append(
+            {
+                "id": ind.get("id"),
+                "module": module,
+                "key": key,
+                "target_label": target,
+                "horizons": horizon_results,
+            }
+        )
+
+    validation_id = secrets.token_hex(8)
+    validation_obj: Dict[str, Any] = {
+        "validation_id": validation_id,
+        "snapshot_id": req.snapshot_id,
+        "as_of_date": as_of_date_str,
+        "created_ts": time.time(),
+        "config": {
+            "quantiles": quantiles,
+            "indicator_ids": [x.get("id") for x in selected],
+        },
+        "warnings": warnings,
+        "results_by_module": results_by_module,
+    }
+    validation_obj["llm_summary"] = _build_validation_llm_summary(validation_obj)
+    _save_validation_to_disk(validation_obj)
+    return validation_obj
+
+
+@app.get("/v3/validation/{validation_id}")
+async def get_validation(validation_id: str, auth: Any = Depends(require_auth)) -> Dict[str, Any]:
+    val = _get_validation(validation_id)
+    if not val:
+        raise HTTPException(status_code=404, detail="Validation not found")
+    return val
+
+
+@app.get("/v3/llm_logs/{kind}/{snapshot_id}")
+async def get_llm_logs(
+    kind: str,
+    snapshot_id: str,
+    module: Optional[str] = Query(None, description="Required when kind=module"),
+    limit: int = Query(200, ge=1, le=2000),
+    auth: Any = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    读取持久化的 LLM 调用过程日志（JSONL）。
+
+    - kind=module: 需要额外传 module=fundamentals|liquidity|sentiment|technicals，读取 {LLM_LOG_DIR}/module/{sid}/{module}.jsonl
+    - kind=overall|chat: 读取 {LLM_LOG_DIR}/{kind}/{sid}/events.jsonl
+    """
+    k = (kind or "").strip().lower()
+    sid = (snapshot_id or "").strip()
+    if k not in {"module", "overall", "chat"}:
+        raise HTTPException(status_code=400, detail="Invalid kind (must be module|overall|chat)")
+    if not sid:
+        raise HTTPException(status_code=400, detail="snapshot_id is required")
+
+    base = os.path.join(LLM_LOG_DIR, k, sid)
+    if k == "module":
+        m = (module or "").strip().lower()
+        if m not in {"fundamentals", "liquidity", "sentiment", "technicals"}:
+            raise HTTPException(status_code=400, detail="module is required when kind=module")
+        path = os.path.join(base, f"{m}.jsonl")
+    else:
+        m = None
+        path = os.path.join(base, "events.jsonl")
+
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="LLM log not found")
+
+    events: List[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        events.append(obj)
+                except Exception:
+                    continue
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    truncated = False
+    if len(events) > limit:
+        events = events[-limit:]
+        truncated = True
+
+    return {
+        "kind": k,
+        "snapshot_id": sid,
+        "module": m,
+        "count": len(events),
+        "truncated": truncated,
+        "events": events,
+    }
+
+
 class ModuleAnalysisRequest(BaseModel):
     snapshot_id: str
     module: str
@@ -2823,6 +3631,8 @@ class OverallAnalysisRequest(BaseModel):
     include_module_summaries: Optional[bool] = True
     provider: Optional[str] = None
     model: Optional[str] = None
+    validation_id: Optional[str] = None
+    force_regenerate: Optional[bool] = False  # 强制重新生成，默认使用缓存
 
 
 @app.post("/v3/analysis/overall")
@@ -2830,20 +3640,44 @@ async def analyse_overall(req: OverallAnalysisRequest, auth: Any = Depends(requi
     """对所有模块进行综合 LLM 分析。
 
     该端点会：
-    1. 获取快照中的所有模块数据
-    2. 使用 build_llm_prompts() 构建综合分析 prompt
-    3. 调用 Gemini API 生成完整的市场分析报告（如果 call_llm=True）
+    1. 检查是否已有缓存的分析结果（如果 force_regenerate=False）
+    2. 如果有缓存，直接返回缓存结果
+    3. 否则调用 Gemini API 生成新的分析报告
     
     参数：
     - snapshot_id: 快照 ID（由 /v3/snapshot/run 生成）
     - call_llm: 是否调用 LLM（默认 True）
     - include_module_summaries: 是否包含模块级别的信号/启发式标签/数据质量信息
+    - force_regenerate: 是否强制重新生成（忽略缓存，默认 False）
     """
     snapshot = _get_snapshot(req.snapshot_id)
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found")
     modules = snapshot["modules"]
     labels = snapshot["labels"]
+
+    # === 缓存检查：如果已有分析结果且不强制重新生成，直接返回缓存 ===
+    cached_report = snapshot.get("last_overall_report")
+    if cached_report and not req.force_regenerate and req.call_llm:
+        # 返回缓存的分析结果
+        response: Dict[str, Any] = {
+            "analysis": cached_report,
+            "labels": labels,
+            "llm_provider": "gemini",
+            "llm_model": snapshot.get("last_overall_report_model", "unknown"),
+            "from_cache": True,  # 标记来自缓存
+            "cached_at": snapshot.get("last_overall_report_ts"),
+        }
+        if req.validation_id:
+            v = _get_validation(req.validation_id)
+            if v:
+                response["validation_id"] = req.validation_id
+                response["validation_summary"] = (v.get("llm_summary") or "").strip() or _build_validation_llm_summary(v)
+        if req.include_module_summaries:
+            response["heuristics"] = snapshot["heuristics"]
+            response["data_quality"] = snapshot["data_quality"]
+            response["signals"] = snapshot["signals"]
+        return response
 
     # 可选：拼接按钮1模块短评输出（若已生成）
     module_reports = snapshot.get("llm_module_reports") or {}
@@ -2871,12 +3705,18 @@ async def analyse_overall(req: OverallAnalysisRequest, auth: Any = Depends(requi
 
     as_of_date = str(snapshot.get("date") or "")
     system_prompt = GLOBAL_SYSTEM_PROMPT
+    supplemental_overall = None
+    if req.validation_id:
+        v = _get_validation(req.validation_id)
+        if not v:
+            raise HTTPException(status_code=404, detail="Validation not found")
+        supplemental_overall = (v.get("llm_summary") or "").strip() or _build_validation_llm_summary(v)
     user_prompt = build_overall_user_prompt(
         as_of_date=as_of_date,
         prompt_context_text=prompt_context_text,
         labels=labels,
         module_reports_or_empty=module_reports_text,
-        supplemental_overall=None,
+        supplemental_overall=supplemental_overall,
     )
     
     response: Dict[str, Any] = {
@@ -2884,6 +3724,9 @@ async def analyse_overall(req: OverallAnalysisRequest, auth: Any = Depends(requi
         "user_prompt": user_prompt,
         "labels": labels,
     }
+    if req.validation_id:
+        response["validation_id"] = req.validation_id
+        response["validation_summary"] = supplemental_overall
     
     if req.include_module_summaries:
         response["heuristics"] = snapshot["heuristics"]
